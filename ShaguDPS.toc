@@ -1,0 +1,24 @@
+## Interface: 11200
+## Title: |cffffcc00Shagu|cffffffffDPS
+## Notes: A simple and lightweight DPS and damage meter.
+## Title-zhCN:|CFFEE7600[DPS统计]|RShaguDPS统计
+## Notes-zhCN:Shagu制作的轻量化DPS统计工具。
+## Author: Shagu汉化、武藤纯子酱
+## Version: 5.0.0
+## OptionalDeps: pfUI
+## SavedVariables: ShaguDPS_Config_Account
+## SavedVariablesPerCharacter: ShaguDPS_Config
+## SavedVariablesPerCharacter: ShaguDPS_Cache
+## SavedVariablesPerCharacter: ShaguDPS_Playback
+
+# 核心模块
+core.lua
+
+# 数据解析模块（Nampower 优先，否则回退到战斗日志）
+parser.lua
+parser-vanilla.lua
+
+# 界面模块
+window.lua
+pfui_skin.lua
+settings.lua
