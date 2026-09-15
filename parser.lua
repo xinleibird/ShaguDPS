@@ -46,7 +46,6 @@ parser.enabled = {
     buff_coverage = true,
     interrupt = true,
     enemy_damage_taken = true,
-    playback = true,
 }
 
 function parser:UpdateEnabledStats()
@@ -66,7 +65,6 @@ function parser:UpdateEnabledStats()
     E.buff_coverage = ShaguDPS.IsStatEnabled(20)
     E.interrupt = ShaguDPS.IsStatEnabled(21)
     E.enemy_damage_taken = ShaguDPS.IsStatEnabled(22)
-    E.playback = ShaguDPS.IsStatEnabled(25)
     if ShaguDPS.hasNampower then
         self:RefreshEventRegistration()
     end
@@ -98,7 +96,7 @@ function parser:RefreshEventRegistration()
     reg("SPELL_ENERGIZE_BY_SELF", E.energize)
     reg("SPELL_ENERGIZE_BY_OTHER", E.energize)
     reg("SPELL_FAILED_OTHER", E.interrupt)
-    reg("UNIT_DIED", E.death or E.playback)
+    reg("UNIT_DIED", E.death)
 end
 
 -- 用于计算溢出伤害的单位血量缓存
@@ -348,10 +346,6 @@ local function resetCurrentSegment()
     data["interrupt"][1] = {}
     data["enemy_damage_taken"][1] = {}
     data.death_replays = {}
-    data.playback[1] = {}
-    ShaguDPS.playback_death_times = {}
-    ShaguDPS.playback_unit_deaths = {}
-    ShaguDPS.playback_damaged = {}
     parser.extraAttacks = {}
     ShaguDPS.activeBadDispelDebuffs = {}
     ShaguDPS.wrongDispels = {}
@@ -728,8 +722,6 @@ end
 -- 将当前战斗（伤害/治疗段 1）保存为"最近战斗"快照（最多保留 5 场）。
 -- 条件：有伤害或治疗数据，且战斗时长 ≥ 10 秒。
 -- 名称取本场战斗血量最高的敌人（近似判断 BOSS 名）。
--- 同时把当前回放数据压入 ShaguDPS_Playback.recent，并保持与
--- ShaguDPS.recent_fights 长度一致（同步截断）。
 local function storeRecentFight()
     if not next(data.damage[1]) and not next(data.heal[1]) then
         return
@@ -775,10 +767,8 @@ local function storeRecentFight()
         death_replays = deepcopy(data.death_replays),
     }
     table.insert(ShaguDPS.recent_fights, recentFight)
-    table.insert(ShaguDPS_Playback.recent, deepcopy(data.playback[1]))
     while table.getn(ShaguDPS.recent_fights) > 5 do
         table.remove(ShaguDPS.recent_fights, 1)
-        table.remove(ShaguDPS_Playback.recent, 1)
     end
     local count = table.getn(ShaguDPS.recent_fights)
     for i = 1, count do
@@ -863,10 +853,6 @@ function parser.combat:UpdateState(forceNoCombat)
             if next(data.weakness_coverage[1]) then ShaguDPS.cached_current_weakness_coverage = deepcopy(data.weakness_coverage[1]) end
             if next(data.interrupt[1]) then ShaguDPS.cached_current_interrupt = deepcopy(data.interrupt[1]) end
             if next(data.death_replays) then ShaguDPS.cached_current_death_replays = deepcopy(data.death_replays) end
-            if next(data.playback[1]) then
-                ShaguDPS.cached_current_playback = deepcopy(data.playback[1])
-                ShaguDPS_Playback.current = ShaguDPS.cached_current_playback
-            end
 
             storeRecentFight()
 
@@ -924,7 +910,6 @@ function parser.combat:UpdateState(forceNoCombat)
                             for _, existingName in ipairs(fight.bosses) do
                                 if name == existingName then
                                     ShaguDPS.boss_fights[i] = bossFight
-                                    ShaguDPS_Playback.boss[i] = deepcopy(data.playback[1])
                                     replaced = true
                                     break
                                 end
@@ -937,7 +922,6 @@ function parser.combat:UpdateState(forceNoCombat)
 
                 if not replaced then
                     table.insert(ShaguDPS.boss_fights, bossFight)
-                    table.insert(ShaguDPS_Playback.boss, deepcopy(data.playback[1]))
                     ShaguDPS.current_boss_index = table.getn(ShaguDPS.boss_fights)
                 else
                     ShaguDPS.current_boss_index = i
@@ -966,11 +950,6 @@ function parser.combat:UpdateState(forceNoCombat)
             healthCache = {}
             data.enemy_max_health = {}
             is_boss_encounter = false
-            ShaguDPS.playback_death_times = {}
-            ShaguDPS.playback_unit_deaths = {}
-            data.playback[1] = {}
-            ShaguDPS.cached_current_playback = nil
-            ShaguDPS.playback_damaged = {}
             ShaguDPS.cached_current_damage = nil
             ShaguDPS.cached_current_heal = nil
             ShaguDPS.cached_current_death = nil
@@ -1011,12 +990,6 @@ parser.combat:SetScript("OnEvent", function()
     if event == "PLAYER_UNGHOST" then
         this:UpdateState(true)
     elseif event == "PLAYER_LOGOUT" then
-        -- 战斗中直接退出：把当前战斗回放深拷贝到 ShaguDPS_Playback.current 并保存缓存，
-        -- 避免当前战斗回放在未脱战就退出时丢失
-        if data and data.playback and data.playback[1] and next(data.playback[1]) then
-            ShaguDPS.cached_current_playback = deepcopy(data.playback[1])
-            ShaguDPS_Playback.current = ShaguDPS.cached_current_playback
-        end
         ShaguDPS.SaveDataToCache()
         -- 若开启"数据导出到Imports"，在写入 WTF 前把全部统计数据导出到 Imports 并清空 WTF 数据
         if ShaguDPS.OnLogoutExport then ShaguDPS.OnLogoutExport() end
@@ -1085,14 +1058,6 @@ local function updateStats(source, action, target, value, school, datatype, effe
     end
 
     local now = GetTime()
-    -- 动作回放：记录“施法者 → 造成伤害的目标”关系，供目标死亡时反查伤害者
-    if datatype == "damage" and finalSource and target and type(target) == "string" and target ~= "" then
-        if ShaguDPS.playback_damaged then
-            if not ShaguDPS.playback_damaged[target] then ShaguDPS.playback_damaged[target] = {} end
-            -- 记录最近一次对该目标的伤害时间（相对战斗开始），用于死亡相关性判定
-            ShaguDPS.playback_damaged[target][finalSource] = GetTime() - combat_start_time
-        end
-    end
     for segment = 0, 1 do
         local entry = data[datatype][segment]
         if not entry[finalSource] then
@@ -2694,133 +2659,6 @@ local function onUnitDied(guid)
         parser:HandleWeaknessTargetDeath(guid, name, GetTime())
     end
 
-    -- 动作回放：记录死亡时间，并修正死亡与导致死亡的施法事件错位
-    if ShaguDPS.hasNampower and parser.enabled.playback and combat_start_time > 0 then
-        local deathRel = GetTime() - combat_start_time
-
-        if not ShaguDPS.playback_death_times then ShaguDPS.playback_death_times = {} end
-        if not ShaguDPS.playback_death_times[guid] then ShaguDPS.playback_death_times[guid] = {} end
-        table.insert(ShaguDPS.playback_death_times[guid], deathRel)
-
-        local pb = data.playback[1]
-        if pb then
-            for _, entry in pairs(pb) do
-                if entry and entry._events then
-                    for _, ev in ipairs(entry._events) do
-                        if ev.tguid == guid then
-                            if ev.t > deathRel and ev.t <= deathRel + 1 then
-                                ev.t = deathRel
-                            end
-                            if ev.t >= deathRel then
-                                ev.dead = true
-                            end
-                        end
-                    end
-                end
-            end
-        end
-
-        if name then
-            local ownerName, _, _ = GetOwnerInfoFromPetGUID(guid)
-            local dName
-            local isPetDeath = false
-            if ownerName then
-                if config.merge_pets == 1 then
-                    dName = ownerName
-                    isPetDeath = true
-                else
-                    dName = ownerName .. " - " .. name
-                end
-            else
-                dName = name
-            end
-            if not ShaguDPS.playback_unit_deaths then ShaguDPS.playback_unit_deaths = {} end
-            if not ShaguDPS.playback_unit_deaths[dName] then ShaguDPS.playback_unit_deaths[dName] = {} end
-            table.insert(ShaguDPS.playback_unit_deaths[dName], deathRel)
-
-            -- 把该单位自身死亡时间写入回放条目（用于“XXX - 死亡”展示）
-            -- 注意：merge_pets=1 时宠物死亡不写入主人条目的 _deaths，避免“宠物死算到主人头上”
-            if data.playback[1] and data.playback[1][dName] then
-                if not isPetDeath then
-                    if not data.playback[1][dName]._deaths then
-                        data.playback[1][dName]._deaths = {}
-                    end
-                    table.insert(data.playback[1][dName]._deaths, deathRel)
-                end
-            end
-        end
-
-        -- 施法对象死亡：给对该目标造成过伤害的单位回放记录目标死亡时间（xx.x秒 xxx 死亡）
-        -- 目标死亡后名字可能已消失，因此不依赖 name，先从伤害映射/施法事件反查目标名
-        local targetDisplay = nil
-        local pb = data.playback[1]
-        if pb then
-            for _, entry in pairs(pb) do
-                if entry and entry._events then
-                    for _, ev in ipairs(entry._events) do
-                        if ev.tguid == guid and ev.target and not isUnknownName(ev.target) then
-                            targetDisplay = ev.target
-                            break
-                        end
-                    end
-                    if targetDisplay then break end
-                end
-            end
-        end
-        if not targetDisplay and name and not isUnknownName(name) then
-            targetDisplay = name
-        end
-        if targetDisplay then
-            local ownerName, _, _ = GetOwnerInfoFromPetGUID(guid)
-            local rawName = targetDisplay
-            if ownerName and config.merge_pets == 0 then
-                targetDisplay = ownerName .. " - " .. targetDisplay
-            end
-            -- 收集所有对该目标造成过伤害的施法者（含AOE无施法目标的情况）
-            -- 只统计死亡前10秒内有施法/伤害记录的施法者，判定目标死亡与施法相关
-            local damagers = {}
-            local function collectDamagers(damagedTable)
-                if not damagedTable then return end
-                for srcName, lastTime in pairs(damagedTable) do
-                    if type(lastTime) == "number" and deathRel - lastTime <= 10 then
-                        damagers[srcName] = true
-                    end
-                end
-            end
-            collectDamagers(ShaguDPS.playback_damaged and ShaguDPS.playback_damaged[targetDisplay])
-            if rawName ~= targetDisplay then
-                collectDamagers(ShaguDPS.playback_damaged and ShaguDPS.playback_damaged[rawName])
-            end
-            -- 施法事件中也统计施法者（应对宠物/合并等名字差异），同样限定10秒内
-            local pb = data.playback[1]
-            if pb then
-                for fname, entry in pairs(pb) do
-                    if entry and entry._events and fname ~= targetDisplay then
-                        local hit = false
-                        for _, ev in ipairs(entry._events) do
-                            if ev.tguid == guid and deathRel - (ev.t or 0) <= 10 then
-                                hit = true
-                                break
-                            end
-                        end
-                        if hit then damagers[fname] = true end
-                    end
-                end
-            end
-            for srcName in pairs(damagers) do
-                if srcName ~= targetDisplay and data.playback[1] and data.playback[1][srcName] then
-                    local entry = data.playback[1][srcName]
-                    if not entry._target_deaths then entry._target_deaths = {} end
-                    local friendly = isUnitTracked(guid)
-                    if not friendly and UnitExists(guid) then
-                        friendly = IsFriendly(guid) == 1
-                    end
-                    table.insert(entry._target_deaths, { t = deathRel, name = targetDisplay, friendly = friendly })
-                end
-            end
-        end
-    end
-
     if not parser.enabled.death then return end
     healthCache[guid] = nil
 
@@ -3381,57 +3219,6 @@ if ShaguDPS.hasNampower then
             entry[attackerName][action] = (entry[attackerName][action] or 0) + 1
         end
 
-        -- 动作回放：记录平砍事件（仅当前战斗）
-        if parser.enabled.playback and combat_start_time > 0 then
-            local relTime = GetTime() - combat_start_time
-            local atkName = SafeUnitName("player")
-            local tName = nil
-            local ttype = "none"
-            local tDead = false
-            if targetGuid and targetGuid ~= "0x0000000000000000" and targetGuid ~= attackerGuid then
-                local tn = SafeUnitName(targetGuid)
-                if tn and not isUnknownName(tn) then tName = tn end
-                if IsFriendly(targetGuid) then
-                    ttype = "friendly"
-                else
-                    ttype = "enemy"
-                end
-                if isUnitTracked(targetGuid) and UnitIsDead(targetGuid) == 1 then
-                    tDead = true
-                end
-                local deaths = ShaguDPS.playback_death_times and ShaguDPS.playback_death_times[targetGuid]
-                if deaths and table.getn(deaths) > 0 then
-                    local lastDeath = deaths[table.getn(deaths)]
-                    if relTime > lastDeath and relTime <= lastDeath + 1 then
-                        relTime = lastDeath
-                    end
-                    if relTime >= lastDeath then
-                        tDead = true
-                    end
-                end
-            end
-            if not data.playback[1][atkName] then
-                data.playback[1][atkName] = { _total = 0, _events = {} }
-            end
-            local pbEntry = data.playback[1][atkName]
-            pbEntry._total = (pbEntry._total or 0) + 1
-            table.insert(pbEntry._events, {
-                t = relTime,
-                spell = action,
-                stype = "player",
-                target = tName,
-                ttype = ttype,
-                tguid = targetGuid,
-                tclass = nil,
-                towner = nil,
-                charmedBy = nil,
-                dead = tDead,
-            })
-            if table.getn(pbEntry._events) > 5000 then
-                table.remove(pbEntry._events, 1)
-            end
-        end
-
         if victimState ~= 1 then return end
 
         local rawDamage = totalDamage
@@ -3580,56 +3367,6 @@ if ShaguDPS.hasNampower then
             if not entry[swingFinalName] then entry[swingFinalName] = { ["_total"] = 0 } end
             entry[swingFinalName]["_total"] = (entry[swingFinalName]["_total"] or 0) + 1
             entry[swingFinalName][swingFinalAction] = (entry[swingFinalName][swingFinalAction] or 0) + 1
-        end
-
-        -- 动作回放：记录其他单位平砍事件（仅当前战斗）
-        if parser.enabled.playback and combat_start_time > 0 then
-            local relTime = GetTime() - combat_start_time
-            local tName = nil
-            local ttype = "none"
-            local tDead = false
-            if targetGuid and targetGuid ~= "0x0000000000000000" and targetGuid ~= attackerGuid then
-                local tn = SafeUnitName(targetGuid)
-                if tn and not isUnknownName(tn) then tName = tn end
-                if IsFriendly(targetGuid) then
-                    ttype = "friendly"
-                else
-                    ttype = "enemy"
-                end
-                if isUnitTracked(targetGuid) and UnitIsDead(targetGuid) == 1 then
-                    tDead = true
-                end
-                local deaths = ShaguDPS.playback_death_times and ShaguDPS.playback_death_times[targetGuid]
-                if deaths and table.getn(deaths) > 0 then
-                    local lastDeath = deaths[table.getn(deaths)]
-                    if relTime > lastDeath and relTime <= lastDeath + 1 then
-                        relTime = lastDeath
-                    end
-                    if relTime >= lastDeath then
-                        tDead = true
-                    end
-                end
-            end
-            if not data.playback[1][swingFinalName] then
-                data.playback[1][swingFinalName] = { _total = 0, _events = {} }
-            end
-            local pbEntry = data.playback[1][swingFinalName]
-            pbEntry._total = (pbEntry._total or 0) + 1
-            table.insert(pbEntry._events, {
-                t = relTime,
-                spell = swingFinalAction,
-                stype = swingOwnerName and "pet" or "player",
-                target = tName,
-                ttype = ttype,
-                tguid = targetGuid,
-                tclass = nil,
-                towner = nil,
-                charmedBy = nil,
-                dead = tDead,
-            })
-            if table.getn(pbEntry._events) > 5000 then
-                table.remove(pbEntry._events, 1)
-            end
         end
 
         if victimState ~= 1 then return end
@@ -4141,7 +3878,7 @@ if ShaguDPS.hasNampower then
             end
         end
         TrackCombatant(casterGuid, targetGuid)
-        if not parser.enabled.spellcast and not parser.enabled.sunder and not parser.enabled.revive and not parser.enabled.interrupt and not parser.enabled.playback then return end
+        if not parser.enabled.spellcast and not parser.enabled.sunder and not parser.enabled.revive and not parser.enabled.interrupt then return end
         local name = SafeUnitName(casterGuid)
         if isUnknownName(name) then
             local args = {itemId, spellId, casterGuid, targetGuid, castFlags, numTargetsHit, numTargetsMissed, corpseOwnerGuid}
@@ -4245,94 +3982,6 @@ if ShaguDPS.hasNampower then
             end
             local targetCounts = details[sourceType][targetType]
             targetCounts[displaySpellName] = (targetCounts[displaySpellName] or 0) + 1
-        end
-
-        -- 动作回放（仅当前战斗，战斗开始后记录；记录施法时间与目标详情）
-        if parser.enabled.playback and combat_start_time > 0 then
-            local relTime = GetTime() - combat_start_time
-            local targetName = nil
-            local targetClass = nil
-            local targetOwner = nil
-            local charmedBy = nil
-            local targetDead = false
-            local trackTarget = false
-
-            if targetGuid and targetGuid ~= "0x0000000000000000" then
-                if targetGuid == casterGuid then
-                    -- 自身施放：目标为自己
-                    targetName = SafeUnitName(casterGuid)
-                    if not targetName then targetName = finalName end
-                    targetClass = data["classes"][finalName]
-                else
-                    local tn = SafeUnitName(targetGuid)
-                    if tn and not isUnknownName(tn) then
-                        targetName = tn
-                    end
-                    trackTarget = isUnitTracked(targetGuid)
-
-                    -- 目标被心控：charm 字段指向控制者
-                    if ShaguDPS.hasNampower and trackTarget then
-                        local charm = GetUnitField(targetGuid, "charm")
-                        if charm and charm ~= "0x0000000000000000" then
-                            local cn = SafeUnitName(charm)
-                            if cn and not isUnknownName(cn) then
-                                charmedBy = cn
-                            end
-                        end
-                    end
-
-                    if targetType == "friendly" then
-                        local ownerName, _, _ = GetOwnerInfoFromPetGUID(targetGuid)
-                        if ownerName then
-                            targetOwner = ownerName
-                            targetClass = data["classes"][ownerName]
-                        else
-                            targetClass = data["classes"][targetName]
-                        end
-                    end
-
-                    if trackTarget and UnitIsDead(targetGuid) == 1 then
-                        targetDead = true
-                    end
-
-                    -- 修正施法事件与目标死亡的错位：目标死亡后1秒内的施法移到死亡时间
-                    local deaths = ShaguDPS.playback_death_times and ShaguDPS.playback_death_times[targetGuid]
-                    if deaths and table.getn(deaths) > 0 then
-                        local lastDeath = deaths[table.getn(deaths)]
-                        if relTime > lastDeath and relTime <= lastDeath + 1 then
-                            relTime = lastDeath
-                        end
-                        if relTime >= lastDeath then
-                            targetDead = true
-                        end
-                    end
-                end
-            end
-
-            if not data.playback[1][finalName] then
-                data.playback[1][finalName] = { _total = 0, _events = {} }
-            end
-            local pbEntry = data.playback[1][finalName]
-            pbEntry._total = (pbEntry._total or 0) + 1
-
-            local ev = {
-                t = relTime,
-                spell = displaySpellName,
-                stype = sourceType,
-                target = targetName,
-                ttype = targetType,
-                tguid = targetGuid,
-                tclass = targetClass,
-                towner = targetOwner,
-                charmedBy = charmedBy,
-                dead = targetDead,
-            }
-            table.insert(pbEntry._events, ev)
-
-            -- 防止内存无限增长，保留最近 5000 条
-            if table.getn(pbEntry._events) > 5000 then
-                table.remove(pbEntry._events, 1)
-            end
         end
 
         if sunderSpellIds[spellId] then

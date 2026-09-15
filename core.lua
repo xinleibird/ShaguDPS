@@ -167,7 +167,6 @@ local data = {
     buff_coverage = { [0] = {}, [1] = {} },
     weakness_coverage = { [0] = {}, [1] = {} },
     interrupt = { [0] = {}, [1] = {} },
-    playback = { [1] = {} },
     enemy_max_health = {},
     classes = {},
     threat = {},
@@ -369,7 +368,7 @@ end
 -- ============================================================================
 
 if ShaguDPS.hasNampower then
-    ShaguDPS.rightStatViews = {1,2,3,4,5,6,7,8,9,10,11,13,14,16,17,18,19,20,21,22,24,25}
+    ShaguDPS.rightStatViews = {1,2,3,4,5,6,7,8,9,10,11,13,14,16,17,18,19,20,21,22,24}
 else
     ShaguDPS.rightStatViews = {1,2,3,4,11}
 end
@@ -377,26 +376,15 @@ end
 -- 是否启用某统计视图
 -- 视图 ID 说明：
 --  12 = BOSS战, 15 = BOSS汇总, 23 = 最近战斗 —— 不受右侧开关控制，始终可见
---  25 = 动作回放（仅 Nampower 环境），受右侧开关控制
 --  11 = 仇恨 —— 无 Nampower 时仍可用
 function ShaguDPS.IsStatEnabled(viewId)
     if viewId == 12 or viewId == 15 or viewId == 23 then return true end
-    if viewId == 25 then return ShaguDPS.hasNampower and ShaguDPS.config.enabled_stats[25] ~= 0 end
     if not ShaguDPS.hasNampower and viewId ~= 11 and viewId > 4 then
         return false
     end
     local enabled_stats = ShaguDPS.config and ShaguDPS.config.enabled_stats
     if not enabled_stats then return true end
     return enabled_stats[viewId] ~= 0
-end
-
--- 动作回放视图仅在当前/近期战斗/BOSS战中可用，全程/小怪/BOSS汇总不可见
--- segmentType: 0=全程 1=当前 2=小怪；viewId 可为普通视图ID或12/15/23
-function ShaguDPS.IsPlaybackViewApplicable(segmentType, viewId)
-    if viewId == 15 then return false end
-    if viewId == 12 or viewId == 23 then return true end
-    if segmentType == 0 or segmentType == 2 then return false end
-    return true
 end
 
 function ShaguDPS.GetFirstEnabledStat()
@@ -430,21 +418,10 @@ ShaguDPS.boss_fights = ShaguDPS.boss_fights or {}
 ShaguDPS.recent_fights = ShaguDPS.recent_fights or {}
 ShaguDPS.current_recent_index = nil
 
--- 动作回放独立保存（SavedVariablesPerCharacter: ShaguDPS_Playback）
--- 注意：ShaguDPS_Playback 必须保持独立表，不能与 ShaguDPS_Cache 的任何字段共享引用，
--- 否则 WoW 序列化 SavedVariables 时会把重复引用判定为"已保存"而跳过，导致独立变量保存失败。
-ShaguDPS_Playback = ShaguDPS_Playback or {
-    current = nil,  -- 当前战斗回放
-    recent = {},    -- [index] = playback，与 ShaguDPS.recent_fights 对应
-    boss = {},      -- [index] = playback，与 ShaguDPS.boss_fights 对应
-}
-ShaguDPS.cached_current_playback = ShaguDPS_Playback.current
-
 function ShaguDPS.ClearBossFights()
     for i = table.getn(ShaguDPS.boss_fights), 1, -1 do
         table.remove(ShaguDPS.boss_fights, i)
     end
-    ShaguDPS_Playback.boss = {}
     if ShaguDPS_Cache then
         ShaguDPS_Cache.boss_fights = {}
     end
@@ -699,26 +676,6 @@ function ShaguDPS.LoadDataFromCache()
             if not data.small_fight[key] then data.small_fight[key] = init end
         end
     end
-    -- 动作回放：从独立保存变量恢复
-    if ShaguDPS_Playback and ShaguDPS_Playback.current then
-        ShaguDPS.cached_current_playback = ShaguDPS_Playback.current
-        ShaguDPS.playback_damaged = ShaguDPS.playback_damaged or {}
-    end
-    -- 确保 Playback.recent 与 recent_fights 索引对齐（长度不一致时截断到较小者）
-    if ShaguDPS_Playback and ShaguDPS_Playback.recent and ShaguDPS.recent_fights then
-        local rLen = table.getn(ShaguDPS_Playback.recent)
-        local fLen = table.getn(ShaguDPS.recent_fights)
-        if rLen > fLen then
-            for i = fLen + 1, rLen do ShaguDPS_Playback.recent[i] = nil end
-        end
-    end
-    if ShaguDPS_Playback and ShaguDPS_Playback.boss and ShaguDPS.boss_fights then
-        local bLen = table.getn(ShaguDPS_Playback.boss)
-        local fLen = table.getn(ShaguDPS.boss_fights)
-        if bLen > fLen then
-            for i = fLen + 1, bLen do ShaguDPS_Playback.boss[i] = nil end
-        end
-    end
 
     -- 修正异常 _ctime
     local function fixCtime(tbl)
@@ -771,16 +728,6 @@ function ShaguDPS.ClearCache()
     ShaguDPS.cached_current_weakness_coverage = nil
     ShaguDPS.cached_current_interrupt = nil
     ShaguDPS.cached_current_death_replays = nil
-    data.playback[1] = {}
-    ShaguDPS.cached_current_playback = nil
-    ShaguDPS_Playback = {
-        current = nil,
-        recent = {},
-        boss = {},
-    }
-    ShaguDPS.playback_damaged = {}
-    ShaguDPS.playback_death_times = {}
-    ShaguDPS.playback_unit_deaths = {}
     data.death_replays = {}
     data.all_death_replays = {}
     ShaguDPS.boss_fights = {}
@@ -897,7 +844,7 @@ local function exportBaseName()
     return "shagudps-" .. (UnitName("player") or "Unknown")
 end
 
--- 导出全部统计数据（ShaguDPS_Cache + ShaguDPS_Playback）到 Imports（按 512KB 分片）
+-- 导出全部统计数据（ShaguDPS_Cache）到 Imports（按 512KB 分片）
 -- @return true 表示导出成功
 function ShaguDPS.ExportDataToImports()
     if not ShaguDPS.IsExportAvailable() then return false end
@@ -905,7 +852,6 @@ function ShaguDPS.ExportDataToImports()
         version = 1,
         timestamp = time and time() or 0,
         cache = ShaguDPS_Cache,
-        playback = ShaguDPS_Playback,
     }
     local serialized = ShaguDPS.Serialize(payload)
     local total = string.len(serialized)
@@ -930,7 +876,7 @@ function ShaguDPS.ExportDataToImports()
     return ok == true
 end
 
--- 从 Imports 读取分片并还原，写回 ShaguDPS_Cache / ShaguDPS_Playback
+-- 从 Imports 读取分片并还原，写回 ShaguDPS_Cache
 -- @return true 表示导入成功
 function ShaguDPS.ImportDataFromImports()
     if not ShaguDPS.IsExportAvailable() then return false end
@@ -957,7 +903,6 @@ function ShaguDPS.ImportDataFromImports()
     local ok2, payload = pcall(chunk)
     if not ok2 or type(payload) ~= "table" then return false end
     if type(payload.cache) == "table" then ShaguDPS_Cache = payload.cache end
-    if type(payload.playback) == "table" then ShaguDPS_Playback = payload.playback end
     return true
 end
 
@@ -967,7 +912,6 @@ function ShaguDPS.OnLogoutExport()
     if config.export_to_imports ~= 1 then return end
     if ShaguDPS.ExportDataToImports() then
         ShaguDPS_Cache = {}
-        ShaguDPS_Playback = { current = nil, recent = {}, boss = {} }
     end
 end
 

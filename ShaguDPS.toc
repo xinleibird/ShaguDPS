@@ -9,7 +9,6 @@
 ## SavedVariables: ShaguDPS_Config_Account
 ## SavedVariablesPerCharacter: ShaguDPS_Config
 ## SavedVariablesPerCharacter: ShaguDPS_Cache
-## SavedVariablesPerCharacter: ShaguDPS_Playback
 
 # 核心模块
 core.lua

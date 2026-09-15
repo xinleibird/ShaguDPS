@@ -170,8 +170,6 @@ local view_templates = {
         chat_string = "%s", bar_string = "%s", bar_string_params = { "value" } },
     [24] = { name = "易伤覆盖", sort = "vuln_coverage", bar_max = "vuln_count_max", bar_val = "total_count", bar_lower_max = nil, bar_lower_val = nil,
         chat_string = "%d (%.1f%%)", bar_string = "%d (%.1f%%)", bar_string_params = { "total_count", "avg_cov" } },
-    [25] = { name = "动作回放", sort = "spellcast_total", bar_max = "spellcast_best", bar_val = "spellcast_total", bar_lower_max = nil, bar_lower_val = nil,
-        chat_string = "%s", bar_string = "%s", bar_string_params = { "spellcast_total" } },
 }
 
 -- 普通视图ID <-> BOSS内部统计索引 的映射
@@ -182,7 +180,7 @@ do
         [1] = 1, [2] = 2, [3] = 3, [4] = 4, [5] = 5, [6] = 6,
         [7] = 7, [8] = 8, [9] = 9, [10] = 10, [13] = 11, [14] = 12,
         [16] = 13, [17] = 14, [18] = 15, [19] = 16, [20] = 17,
-        [21] = 18, [22] = 19, [24] = 20, [25] = 21,
+        [21] = 18, [22] = 19, [24] = 20,
     }
     for viewId, bossIdx in pairs(mapping) do
         viewToBossStat[viewId] = bossIdx
@@ -190,13 +188,13 @@ do
     end
 end
 
--- BOSS内部统计索引(1-21) → 右侧统计视图ID(1-25) 映射常量
+-- BOSS内部统计索引(1-20) → 右侧统计视图ID(1-24) 映射常量
 local bossStatMapFull = {
     [1]=1, [2]=2, [3]=3, [4]=4, [5]=5, [6]=6,
     [7]=7, [8]=8, [9]=9, [10]=10,
     [11]=13, [12]=14, [13]=16, [14]=17,
     [15]=18, [16]=19, [17]=20, [18]=21, [19]=22,
-    [20]=24, [21]=25,
+    [20]=24,
 }
 
 -- 菜单按钮定义（左侧菜单包括 Current、Overall、Small；右侧为各种统计类型）
@@ -230,7 +228,6 @@ if ShaguDPS.hasNampower then
     menubuttons["Interrupt"] = { 18, 21, 25.5, "打断", "|cffffffff显示打断统计", "view" }
     menubuttons["EnemyTaken"] = { 19, 22, 25.5, "敌人承伤", "|cffffffff显示被追踪单位攻击的目标承受的伤害", "view" }
     menubuttons["VulnCov"] = { 20, 24, 25.5, "易伤覆盖", "|cffffffff显示敌人目标身上易伤debuff的覆盖率", "view" }
-    menubuttons["Playback"] = { 21, 25, 25.5, "动作回放", "|cffffffff显示施法与平砍动作回放（按时间倒序）", "view" }
 end
 
 -- 右侧视图ID到按钮名称的映射（用于按开关显示/隐藏）
@@ -241,7 +238,7 @@ local rightViewButton = {
     [11] = "btnThreat", [13] = "btnSunder", [14] = "btnDamageTaken",
     [16] = "btnEnergize", [17] = "btnInvalidDamage", [18] = "btnHealTaken",
     [19] = "btnRevive", [20] = "btnBuffCov", [21] = "btnInterrupt",
-    [22] = "btnEnemyTaken", [24] = "btnVulnCov", [25] = "btnPlayback",
+    [22] = "btnEnemyTaken", [24] = "btnVulnCov",
 }
 
 -- 聊天频道颜色映射
@@ -960,10 +957,6 @@ local function GetDeathReplayLines(unitName, segType, bossFight)
     return lines
 end
 
--- ============================================================================
--- 10. 动作回放详情行生成
--- ============================================================================
-
 -- 将单位名转换为带职业颜色的显示串（返回带 |c 前缀的完整颜色串）
 local function classColorString(classToken, name)
     if classToken and classes[classToken] and RAID_CLASS_COLORS[classToken] then
@@ -974,170 +967,8 @@ local function classColorString(classToken, name)
     return name
 end
 
--- 动作回放死亡记录中的目标名着色：
--- 友方（有职业）→ 职业色；友方宠物 → 主人职业色；友方无职业(NPC) → 绿色；敌方 → 红色
-local function playbackDeathColorName(name, friendly)
-    if not name then return "?" end
-    if not friendly then
-        return "|cffff4444" .. name .. "|r"
-    end
-    local cls = data["classes"] and data["classes"][name]
-    if cls and classes[cls] then
-        return classColorString(cls, name)
-    elseif cls and data["classes"][cls] and classes[data["classes"][cls]] then
-        -- 宠物：cls 是主人名，沿用主人职业色
-        return classColorString(data["classes"][cls], name)
-    end
-    return "|cff00ff00" .. name .. "|r"
-end
-
--- 生成单个目标的显示串（含颜色与括号标注）
--- 规则：敌方红色+(敌方)；友方按职业色+(友方)；宠物显示归属+(友方)；友方NPC绿色+(友方)；
---       被心控的目标加（心控 by XXX）；已死亡目标加（死亡）
-local function formatPlaybackTarget(ev)
-    local name = ev.target or "无目标"
-    local ttype = ev.ttype or "none"
-
-    if ttype == "none" then
-        return "无目标"
-    end
-
-    local label = nil
-    local colorStr
-
-    if ttype == "enemy" then
-        colorStr = "|cffff4444" .. name .. "|r"
-        label = "敌方"
-    elseif ttype == "self" then
-        colorStr = classColorString(ev.tclass, name)
-        label = "自身"
-    else
-        -- friendly
-        local displayName = name
-        if ev.towner then
-            displayName = name .. "（" .. ev.towner .. "）"
-        end
-        if ev.tclass and classes[ev.tclass] then
-            colorStr = classColorString(ev.tclass, displayName)
-        elseif ev.towner then
-            -- 宠物：按主人职业着色
-            colorStr = classColorString(data["classes"][ev.towner], displayName)
-        else
-            -- 友方NPC 绿色
-            colorStr = "|cff00ff00" .. displayName .. "|r"
-        end
-        label = "友方"
-    end
-
-    local result = colorStr
-    if ev.charmedBy then
-        -- 被心控的目标：以“心控 by XXX”为主要标注
-        result = result .. "（心控 by " .. ev.charmedBy .. "）"
-    elseif label then
-        result = result .. "（" .. label .. "）"
-    end
-    if ev.dead then
-        result = result .. "（死亡）"
-    end
-    return result
-end
-
--- 生成动作回放详情行（时间倒序，含死亡标记）
--- filters: { ttypes = {enemy=true, friendly=true, none=true}, stypes = {player=true, pet=true, item=true}, target = 目标名子串, spell = 技能名子串, startTime, endTime }
-local function GetPlaybackDetailLines(playbackData, unitName, filters)
-    local lines = {}
-    if not playbackData or type(playbackData) ~= "table" then
-        return lines
-    end
-    local entry = playbackData[unitName]
-    if not entry or type(entry) ~= "table" or not entry._events then
-        return lines
-    end
-
-    -- 过滤条件解析
-    local ft = filters and filters.ttypes
-    local fs = filters and filters.stypes
-    local fTarget = filters and filters.target or ""
-    local fSpell = filters and filters.spell or ""
-    local fStart = filters and filters.startTime
-    local fEnd = filters and filters.endTime
-    local function matchSpell(ev)
-        if fSpell == "" then return true end
-        local spellName = ev.spell or ""
-        return string.find(spellName, fSpell, 1, true) ~= nil
-    end
-    local function matchTarget(ev)
-        -- 填了目标名筛选时：无目标事件（ev.target 为 nil）同样被过滤掉
-        if fTarget ~= "" then
-            if not ev.target or string.find(ev.target, fTarget, 1, true) == nil then
-                return false
-            end
-        end
-        return true
-    end
-    local function matchTime(ev)
-        local t = ev.t or 0
-        if fStart and t < fStart then return false end
-        if fEnd and t > fEnd then return false end
-        return true
-    end
-    local function matchTType(ev)
-        if not ft then return true end
-        if ev.ttype == "enemy" then return ft.enemy ~= false end
-        if ev.ttype == "friendly" or ev.ttype == "self" then return ft.friendly ~= false end
-        return ft.none ~= false
-    end
-    local function matchSType(ev)
-        if not fs then return true end
-        -- 旧存档事件可能没有 stype，默认全部显示
-        if not ev.stype then return true end
-        if ev.stype == "player" then return fs.player ~= false end
-        if ev.stype == "pet" then return fs.pet ~= false end
-        return fs.item ~= false
-    end
-
-    table.insert(lines, unitName .. " - 动作回放:")
-    table.insert(lines, "|cffffffff总施放次数: |cffffffff" .. (entry._total or 0))
-
-    -- 合并施法事件、施法对象死亡、自身死亡，统一按时间倒序排列在时间轴上
-    local events = {}
-    for _, ev in ipairs(entry._events) do
-        if matchSpell(ev) and matchTarget(ev) and matchTType(ev) and matchSType(ev) and matchTime(ev) then
-            table.insert(events, { kind = "cast", t = ev.t or 0, ev = ev })
-        end
-    end
-    if entry._target_deaths and table.getn(entry._target_deaths) > 0 then
-        for _, td in ipairs(entry._target_deaths) do
-            table.insert(events, { kind = "death", t = td.t or 0, name = td.name or "?", friendly = td.friendly })
-        end
-    end
-    if entry._deaths and table.getn(entry._deaths) > 0 then
-        for _, dt in ipairs(entry._deaths) do
-            table.insert(events, { kind = "death", t = dt or 0, name = unitName, friendly = true })
-        end
-    end
-    -- 按时间倒序（最近的排最上面）
-    table.sort(events, function(a, b)
-        if a.t ~= b.t then return a.t > b.t end
-        return a.kind > b.kind
-    end)
-
-    table.insert(lines, " ")
-    for _, item in ipairs(events) do
-        if item.kind == "death" then
-            local nameStr = playbackDeathColorName(item.name, item.friendly)
-            table.insert(lines, string.format("[%.1f秒] %s |cffff4040死亡|r", item.t, nameStr))
-        else
-            local ev = item.ev
-            local timeStr = string.format("[%.1f秒] ", ev.t or 0)
-            local spell = "|cffffffff" .. (ev.spell or "?") .. "|r"
-            local target = formatPlaybackTarget(ev)
-            table.insert(lines, timeStr .. spell .. "→" .. target)
-        end
-    end
-    return lines
-end
-
+-- ============================================================================
+-- 11. 进度条鼠标悬停显示详细数据（工具提示）
 -- ============================================================================
 -- 11. 进度条鼠标悬停显示详细数据（工具提示）
 -- ============================================================================
@@ -1235,21 +1066,6 @@ local function barTooltipShow()
     local wid = this.parent:GetID()
     local unitData = segment[this.unit]
     if not unitData then return end
-
-    -- 动作回放视图
-    if this.parent.isPlaybackView then
-        local pbLines = GetPlaybackDetailLines(segment, this.unit)
-        if table.getn(pbLines) == 0 then
-            TooltipAddLine(this.title .. " - 动作回放:")
-            TooltipAddLine("|cffff8888无施法记录|r")
-        else
-            for _, line in ipairs(pbLines) do
-                TooltipAddLine(line)
-            end
-        end
-        GameTooltip:Show()
-        return
-    end
 
     -- 光环覆盖率视图
     if this.parent.isBuffCoverageView then
@@ -2022,20 +1838,6 @@ local function GetBarDetailLines(bar)
     local unitData = segment[bar.unit]
     if not unitData then
         lines = { "无数据" }
-        return lines
-    end
-
-    -- 动作回放视图
-    if bar.parent.isPlaybackView then
-        local pbLines = GetPlaybackDetailLines(segment, bar.unit)
-        if table.getn(pbLines) == 0 then
-            table.insert(lines, bar.title .. " - 动作回放:")
-            table.insert(lines, "|cffff8888无施法记录|r")
-        else
-            for _, line in ipairs(pbLines) do
-                table.insert(lines, line)
-            end
-        end
         return lines
     end
 
@@ -2943,20 +2745,6 @@ local function ApplyDetailFilter(fullLines, fl)
 end
 
 local function CreateDetailWindow(title, lines, barData)
-    -- 动作回放视图：应用过滤条件重新生成详情行
-    if barData and barData.isPlayback and ShaguDPS.detailPlaybackData then
-        local fl = ShaguDPS.detailFilters
-        if fl then
-            lines = GetPlaybackDetailLines(ShaguDPS.detailPlaybackData, barData.unit, {
-                ttypes = fl.ttypes,
-                stypes = fl.stypes,
-                target = fl.target,
-                spell = fl.spell,
-                startTime = fl.startTime,
-                endTime = fl.endTime,
-            })
-        end
-    end
     if not lines or table.getn(lines) == 0 then
         lines = { "无数据" }
     end
@@ -2967,10 +2755,10 @@ local function CreateDetailWindow(title, lines, barData)
         ShaguDPS.detailWindowData = nil
     end
 
-    -- 常规详情过滤（动作回放除外）：关键字搜索 + 起始/结束行号
-    local showLineNumbers = not (barData and barData.isPlayback)
+    -- 常规详情过滤：关键字搜索 + 起始/结束行号
+    local showLineNumbers = true
     local entries = nil
-    if barData and not barData.isPlayback then
+    if barData then
         if not barData._fullLines then
             barData._fullLines = lines
             barData._filter = { keyword = "", startLine = 1, endLine = table.getn(lines) }
@@ -3013,9 +2801,7 @@ local function CreateDetailWindow(title, lines, barData)
     local bottomPadding = -10
     local windowHeight = fixedHeight
     local filterHeight = 0
-    if barData and barData.isPlayback then
-        filterHeight = 106
-    elseif barData then
+    if barData then
         filterHeight = 40
     end
     local visibleHeight = windowHeight - titleHeight - bottomPadding - 10 - filterHeight
@@ -3222,294 +3008,8 @@ local function CreateDetailWindow(title, lines, barData)
         end
     end)
 
-    -- 动作回放过滤面板（仅回放视图显示）
-    local filterPanel = nil
-    if barData and barData.isPlayback then
-        if not ShaguDPS.detailFilters then
-            ShaguDPS.detailFilters = {
-                ttypes = { enemy = true, friendly = true, none = true },
-                stypes = { player = true, pet = true, item = true },
-                target = "",
-                spell = "",
-                startTime = nil,
-                endTime = nil,
-            }
-        end
-
-        local function rebuildFilters()
-            if ShaguDPS.detailWindow and barData then
-                ShaguDPS.detailWindow:Hide()
-                ShaguDPS.detailWindow = nil
-                ShaguDPS.detailWindowData = nil
-                local bd = barData
-                local segName = "当前"
-                local unitTitle = bd.unit
-                local segType = bd.segType
-                if segType == 0 then segName = "全程" elseif segType == 2 then segName = "小怪" end
-                if bd.viewId == 12 then segName = "BOSS"
-                elseif bd.viewId == 15 then segName = "BOSS汇总"
-                elseif bd.viewId == 23 then segName = "最近战斗" end
-                CreateDetailWindow(segName .. " - 动作回放 - " .. unitTitle, nil, bd)
-            end
-        end
-
-        filterPanel = CreateFrame("Frame", nil, f)
-        filterPanel:SetPoint("TOPLEFT", f.title, "BOTTOMLEFT", 0, -2)
-        filterPanel:SetPoint("TOPRIGHT", f.title, "BOTTOMRIGHT", 0, -2)
-        filterPanel:SetHeight(filterHeight)
-        filterPanel:SetFrameStrata("DIALOG")
-        -- 过滤面板内容较多，确保窗口宽度足够
-        f:SetWidth(math.max(windowWidth, 300))
-
-        local fl = ShaguDPS.detailFilters
-        local function makeCheck(label, x, y, tableName, valueKey)
-            -- 使用 UICheckButtonTemplate（与 DamageEx 一致的复选框模板），
-            -- HitRectInsets 为 0，确保点击热区与视觉位置完全一致
-            local check = CreateFrame("CheckButton", nil, filterPanel, "UICheckButtonTemplate")
-            check:ClearAllPoints()
-            check:SetPoint("TOPLEFT", filterPanel, "TOPLEFT", x, y)
-            check:SetWidth(18)
-            check:SetHeight(18)
-            check:SetHitRectInsets(0, 0, 0, 0)
-            check:EnableMouse(true)
-            if isPfui then
-                -- 模仿 pfui_skin.SkinCheckButton：移除默认背景，应用 PFUI 风格，保留金色对勾
-                check:SetNormalTexture("")
-                check:SetBackdrop({
-                    bgFile   = "Interface\\BUTTONS\\WHITE8X8",
-                    edgeFile = "Interface\\BUTTONS\\WHITE8X8",
-                    tile     = false,
-                    tileSize = 0,
-                    edgeSize = 1,
-                    insets   = { left = 0, right = 0, top = 0, bottom = 0 }
-                })
-                check:SetBackdropColor(0, 0, 0, 0.4)
-                check:SetBackdropBorderColor(0.4, 0.4, 0.4, 1)
-            end
-            -- label 用独立绝对坐标，文字与复选框水平居中（18px 高，字体11）
-            local text = filterPanel:CreateFontString(nil, "OVERLAY", "GameFontWhite")
-            text:SetPoint("TOPLEFT", filterPanel, "TOPLEFT", x + 20, y - 4)
-            text:SetFont(STANDARD_TEXT_FONT, 11)
-            text:SetText(label)
-            local t = tableName
-            local vk = valueKey
-            check:SetChecked(fl[t][vk] == true)
-            check:SetScript("OnClick", function()
-                fl[t][vk] = this:GetChecked() and true or false
-                rebuildFilters()
-            end)
-            return check
-        end
-
-        -- 第一行：施法目标类型过滤
-        local tl = filterPanel:CreateFontString(nil, "OVERLAY", "GameFontWhite")
-        tl:SetPoint("TOPLEFT", filterPanel, "TOPLEFT", 4, -4)
-        tl:SetFont(STANDARD_TEXT_FONT, 11)
-        tl:SetText("目标:")
-        makeCheck("敌方", 46, -2, "ttypes", "enemy")
-        makeCheck("友方", 112, -2, "ttypes", "friendly")
-        makeCheck("无目标", 178, -2, "ttypes", "none")
-
-        -- 第二行：施法单位类型过滤
-        local sl = filterPanel:CreateFontString(nil, "OVERLAY", "GameFontWhite")
-        sl:SetPoint("TOPLEFT", filterPanel, "TOPLEFT", 4, -32)
-        sl:SetFont(STANDARD_TEXT_FONT, 11)
-        sl:SetText("来源:")
-        makeCheck("玩家", 46, -30, "stypes", "player")
-        makeCheck("宠物", 112, -30, "stypes", "pet")
-        makeCheck("道具", 178, -30, "stypes", "item")
-
-        -- 第三行：目标 / 技能筛选（label 与输入框垂直居中对齐，带冒号）
-        if not fl._lastTarget then fl._lastTarget = fl.target or "" end
-        if not fl._lastSpell then fl._lastSpell = fl.spell or "" end
-        local filterTargetLabel = filterPanel:CreateFontString(nil, "OVERLAY", "GameFontWhite")
-        filterTargetLabel:SetPoint("TOPLEFT", filterPanel, "TOPLEFT", 4, -59)
-        filterTargetLabel:SetFont(STANDARD_TEXT_FONT, 11)
-        filterTargetLabel:SetText("目标:")
-        local targetBox = CreateFrame("EditBox", nil, filterPanel)
-        targetBox:SetPoint("TOPLEFT", filterPanel, "TOPLEFT", 38, -57)
-        targetBox:SetWidth(72)
-        targetBox:SetHeight(16)
-        targetBox:SetAutoFocus(false)
-        targetBox:SetFont(STANDARD_TEXT_FONT, 11)
-        targetBox:SetTextInsets(2, 2, 0, 0)
-        if isPfui then
-            targetBox:SetBackdrop({
-                bgFile   = "Interface\\BUTTONS\\WHITE8X8",
-                edgeFile = "Interface\\BUTTONS\\WHITE8X8",
-                tile     = false,
-                tileSize = 0,
-                edgeSize = 1,
-                insets   = { left = 0, right = 0, top = 0, bottom = 0 }
-            })
-            targetBox:SetBackdropColor(0, 0, 0, 0.4)
-            targetBox:SetBackdropBorderColor(0.4, 0.4, 0.4, 1)
-        else
-            targetBox:SetBackdrop(backdrop)
-            targetBox:SetBackdropColor(0, 0, 0, 0.5)
-        end
-        targetBox:SetText(fl.target or "")
-
-        local filterSpellLabel = filterPanel:CreateFontString(nil, "OVERLAY", "GameFontWhite")
-        filterSpellLabel:SetPoint("TOPLEFT", filterPanel, "TOPLEFT", 160, -59)
-        filterSpellLabel:SetFont(STANDARD_TEXT_FONT, 11)
-        filterSpellLabel:SetText("技能:")
-        local spellBox = CreateFrame("EditBox", nil, filterPanel)
-        spellBox:SetPoint("TOPLEFT", filterPanel, "TOPLEFT", 194, -57)
-        spellBox:SetWidth(72)
-        spellBox:SetHeight(16)
-        spellBox:SetAutoFocus(false)
-        spellBox:SetFont(STANDARD_TEXT_FONT, 11)
-        spellBox:SetTextInsets(2, 2, 0, 0)
-        if isPfui then
-            spellBox:SetBackdrop({
-                bgFile   = "Interface\\BUTTONS\\WHITE8X8",
-                edgeFile = "Interface\\BUTTONS\\WHITE8X8",
-                tile     = false,
-                tileSize = 0,
-                edgeSize = 1,
-                insets   = { left = 0, right = 0, top = 0, bottom = 0 }
-            })
-            spellBox:SetBackdropColor(0, 0, 0, 0.4)
-            spellBox:SetBackdropBorderColor(0.4, 0.4, 0.4, 1)
-        else
-            spellBox:SetBackdrop(backdrop)
-            spellBox:SetBackdropColor(0, 0, 0, 0.5)
-        end
-        spellBox:SetText(fl.spell or "")
-
-        -- 第四行：时间范围过滤（起始 / 结束），label 与输入框与第三行完全对齐
-        local filterStartLabel = filterPanel:CreateFontString(nil, "OVERLAY", "GameFontWhite")
-        filterStartLabel:SetPoint("TOPLEFT", filterPanel, "TOPLEFT", 4, -85)
-        filterStartLabel:SetFont(STANDARD_TEXT_FONT, 11)
-        filterStartLabel:SetText("起始:")
-        local startBox = CreateFrame("EditBox", nil, filterPanel)
-        startBox:SetPoint("TOPLEFT", filterPanel, "TOPLEFT", 38, -83)
-        startBox:SetWidth(72)
-        startBox:SetHeight(16)
-        startBox:SetAutoFocus(false)
-        startBox:SetFont(STANDARD_TEXT_FONT, 11)
-        startBox:SetTextInsets(2, 2, 0, 0)
-        if isPfui then
-            startBox:SetBackdrop({
-                bgFile   = "Interface\\BUTTONS\\WHITE8X8",
-                edgeFile = "Interface\\BUTTONS\\WHITE8X8",
-                tile     = false,
-                tileSize = 0,
-                edgeSize = 1,
-                insets   = { left = 0, right = 0, top = 0, bottom = 0 }
-            })
-            startBox:SetBackdropColor(0, 0, 0, 0.4)
-            startBox:SetBackdropBorderColor(0.4, 0.4, 0.4, 1)
-        else
-            startBox:SetBackdrop(backdrop)
-            startBox:SetBackdropColor(0, 0, 0, 0.5)
-        end
-
-        local filterEndLabel = filterPanel:CreateFontString(nil, "OVERLAY", "GameFontWhite")
-        filterEndLabel:SetPoint("TOPLEFT", filterPanel, "TOPLEFT", 160, -85)
-        filterEndLabel:SetFont(STANDARD_TEXT_FONT, 11)
-        filterEndLabel:SetText("结束:")
-        local endBox = CreateFrame("EditBox", nil, filterPanel)
-        endBox:SetPoint("TOPLEFT", filterPanel, "TOPLEFT", 194, -83)
-        endBox:SetWidth(72)
-        endBox:SetHeight(16)
-        endBox:SetAutoFocus(false)
-        endBox:SetFont(STANDARD_TEXT_FONT, 11)
-        endBox:SetTextInsets(2, 2, 0, 0)
-        if isPfui then
-            endBox:SetBackdrop({
-                bgFile   = "Interface\\BUTTONS\\WHITE8X8",
-                edgeFile = "Interface\\BUTTONS\\WHITE8X8",
-                tile     = false,
-                tileSize = 0,
-                edgeSize = 1,
-                insets   = { left = 0, right = 0, top = 0, bottom = 0 }
-            })
-            endBox:SetBackdropColor(0, 0, 0, 0.4)
-            endBox:SetBackdropBorderColor(0.4, 0.4, 0.4, 1)
-        else
-            endBox:SetBackdrop(backdrop)
-            endBox:SetBackdropColor(0, 0, 0, 0.5)
-        end
-
-        -- 时间默认值：仅首次打开时计算事件时间范围并填入
-        if not fl._timeInitialized then
-            fl._timeInitialized = true
-            local minT = nil
-            local maxT = nil
-            if ShaguDPS.detailPlaybackData and ShaguDPS.detailPlaybackData[barData.unit] then
-                local events = ShaguDPS.detailPlaybackData[barData.unit]._events
-                if events then
-                    for _, ev in ipairs(events) do
-                        local t = ev.t or 0
-                        if not minT or t < minT then minT = t end
-                        if not maxT or t > maxT then maxT = t end
-                    end
-                end
-            end
-            fl.startTime = minT or 0
-            fl.endTime = maxT or 0
-        end
-        startBox:SetText(string.format("%.1f", fl.startTime or 0))
-        endBox:SetText(string.format("%.1f", fl.endTime or 0))
-        if fl._lastStart == nil then fl._lastStart = fl.startTime end
-        if fl._lastEnd == nil then fl._lastEnd = fl.endTime end
-
-        -- EditBox 输入时仅更新过滤值；回车或失焦时延迟应用过滤并重建窗口，
-        -- 用 OnUpdate 延迟处理，避免点击关闭时因失焦误重建
-        targetBox:SetScript("OnTextChanged", function()
-            fl.target = this:GetText() or ""
-        end)
-        spellBox:SetScript("OnTextChanged", function()
-            fl.spell = this:GetText() or ""
-        end)
-        startBox:SetScript("OnTextChanged", function()
-            local t = tonumber(this:GetText() or "")
-            fl.startTime = t or nil
-        end)
-        endBox:SetScript("OnTextChanged", function()
-            local t = tonumber(this:GetText() or "")
-            fl.endTime = t or nil
-        end)
-        local function applyFilterRebuild()
-            local changed = false
-            if fl.target ~= fl._lastTarget then fl._lastTarget = fl.target changed = true end
-            if fl.spell ~= fl._lastSpell then fl._lastSpell = fl.spell changed = true end
-            if fl.startTime ~= fl._lastStart then fl._lastStart = fl.startTime changed = true end
-            if fl.endTime ~= fl._lastEnd then fl._lastEnd = fl.endTime changed = true end
-            if changed then
-                rebuildFilters()
-            end
-        end
-        targetBox:SetScript("OnEnterPressed", applyFilterRebuild)
-        spellBox:SetScript("OnEnterPressed", applyFilterRebuild)
-        startBox:SetScript("OnEnterPressed", applyFilterRebuild)
-        endBox:SetScript("OnEnterPressed", applyFilterRebuild)
-        -- 失焦：延迟到下一帧处理，若窗口已关闭（点关闭按钮）则跳过
-        targetBox:SetScript("OnEditFocusLost", function()
-            filterPanel.needsRebuild = true
-        end)
-        spellBox:SetScript("OnEditFocusLost", function()
-            filterPanel.needsRebuild = true
-        end)
-        startBox:SetScript("OnEditFocusLost", function()
-            filterPanel.needsRebuild = true
-        end)
-        endBox:SetScript("OnEditFocusLost", function()
-            filterPanel.needsRebuild = true
-        end)
-        filterPanel:SetScript("OnUpdate", function()
-            if not this.needsRebuild then return end
-            this.needsRebuild = nil
-            -- 若窗口已关闭则不再重建
-            if not ShaguDPS.detailWindow then return end
-            applyFilterRebuild()
-        end)
-    end
-
-    -- 常规详情过滤面板（动作回放除外）：关键字搜索 + 起始/结束行号
-    if barData and not barData.isPlayback then
+    -- 常规详情过滤面板：关键字搜索 + 起始/结束行号
+    if barData then
         local fl = barData._filter
         local panelWidth = math.max(windowWidth, 300)
         f:SetWidth(panelWidth)
@@ -3933,20 +3433,7 @@ local function CreateBar(parent, i)
             wid = wid,
             segType = segType,
             viewId = viewId,
-            isPlayback = parent.isPlaybackView == true,
         }
-        if barData.isPlayback then
-            ShaguDPS.detailPlaybackData = segment
-            -- 重新打开回放窗口时，重置时间过滤为完整回放范围
-            local fl = ShaguDPS.detailFilters
-            if fl then
-                fl._timeInitialized = false
-                fl.startTime = nil
-                fl.endTime = nil
-                fl._lastStart = nil
-                fl._lastEnd = nil
-            end
-        end
 
         if ShaguDPS.detailWindow and ShaguDPS.detailWindowData then
             if ShaguDPS.detailWindowData.unit == unit and
@@ -4567,9 +4054,6 @@ local function GetData(unitdata, values, isHealTaken, view, isBuffCoverage, segm
             if view == 8 then
                 values.spellcast_total = unitdata._total
                 values.value = unitdata._total
-            elseif view == 25 then
-                values.spellcast_total = unitdata._total
-                values.value = unitdata._total
             elseif view == 9 then
                 values.friendly_fire_total = unitdata._total
                 values.value = unitdata._total
@@ -4680,8 +4164,7 @@ local function Refresh(self, force, report)
             self.segment = {}
         end
     end
-    -- 动作回放仅在当前/近期/BOSS战可用，全程/小怪时自动切回
-    if currentView == 25 and not ShaguDPS.IsPlaybackViewApplicable(config[wid].segment or 1, currentView) then
+    if currentView == 25 then
         local first = ShaguDPS.GetFirstEnabledStat()
         if first then
             config[wid].view = first
@@ -4698,11 +4181,11 @@ local function Refresh(self, force, report)
             [7]=7, [8]=8, [9]=9, [10]=10, [11]=13,
             [12]=14, [13]=16, [14]=17, [15]=18,
             [16]=19, [17]=20, [18]=21, [19]=22,
-            [20]=24, [21]=25,
+            [20]=24,
         }
         local sv = config[wid].boss_stat_view or 1
-        -- 动作回放仅在当前/近期/BOSS战可见，BOSS汇总不可见
-        if currentView == 15 and sv == 21 then
+        -- 兼容旧配置：旧版 boss_stat_view 21 = 动作回放，现已删除，自动回退到 1
+        if sv == 21 or not bossStatToView[sv] then
             sv = 1
             config[wid].boss_stat_view = 1
         end
@@ -4735,7 +4218,6 @@ local function Refresh(self, force, report)
     local isInterruptView = (config[wid].view == 21) or ((isBossView or isBossSummaryView or isRecentFightView) and config[wid].boss_stat_view == 18)
     local isEnemyTakenView = (config[wid].view == 22) or ((isBossView or isBossSummaryView or isRecentFightView) and config[wid].boss_stat_view == 19)
     local isVulnCoverageView = (config[wid].view == 24) or ((isBossView or isBossSummaryView or isRecentFightView) and config[wid].boss_stat_view == 20)
-    local isPlaybackView = (config[wid].view == 25) or ((isBossView or isRecentFightView) and config[wid].boss_stat_view == 21)
 
     self.isHealTakenView = isHealTakenView
     self.isEnergizeView = isEnergizeView
@@ -4744,7 +4226,6 @@ local function Refresh(self, force, report)
     self.isEnemyTakenView = isEnemyTakenView
     self.isVulnCoverageView = isVulnCoverageView
     self.isInterruptView = isInterruptView
-    self.isPlaybackView = isPlaybackView
 
     local segmentType = config[wid].segment or 1
     local isSmallFight = (segmentType == 2)
@@ -4897,21 +4378,17 @@ local function Refresh(self, force, report)
     local modeCount = 0
     for _, viewId in ipairs(ShaguDPS.rightStatViews) do
         if ShaguDPS.IsStatEnabled(viewId) and view_templates[viewId] then
-            if viewId == 25 and not ShaguDPS.IsPlaybackViewApplicable(segmentType, config[wid].view) then
-                -- 动作回放仅在当前/近期/BOSS战可选
+            local name = view_templates[viewId].name
+            if modeCount == 0 then
+                modeLine = name
             else
-                local name = view_templates[viewId].name
-                if modeCount == 0 then
-                    modeLine = name
-                else
-                    modeLine = modeLine .. ", " .. name
-                end
-                modeCount = modeCount + 1
-                if modeCount == 4 then
-                    table.insert(modeTooltipLines, "|cffffffff" .. modeLine .. "|r")
-                    modeLine = ""
-                    modeCount = 0
-                end
+                modeLine = modeLine .. ", " .. name
+            end
+            modeCount = modeCount + 1
+            if modeCount == 4 then
+                table.insert(modeTooltipLines, "|cffffffff" .. modeLine .. "|r")
+                modeLine = ""
+                modeCount = 0
             end
         end
     end
@@ -5014,7 +4491,6 @@ local function Refresh(self, force, report)
         self.btnVulnCov.caption:SetTextColor(1,1,1,1)
         self.btnInterrupt.caption:SetTextColor(1,1,1,1)
         self.btnEnemyTaken.caption:SetTextColor(1,1,1,1)
-        self.btnPlayback.caption:SetTextColor(1,1,1,1)
     end
 
     -- 重置左侧菜单按钮颜色
@@ -5051,7 +4527,7 @@ local function Refresh(self, force, report)
         [11] = "btnThreat", [13] = "btnSunder", [14] = "btnDamageTaken",
         [16] = "btnEnergize", [17] = "btnInvalidDamage", [18] = "btnHealTaken",
         [19] = "btnRevive", [20] = "btnBuffCov", [21] = "btnInterrupt",
-        [22] = "btnEnemyTaken", [24] = "btnVulnCov", [25] = "btnPlayback",
+        [22] = "btnEnemyTaken", [24] = "btnVulnCov",
     }
     if viewToButton[highlightView] then
         self[viewToButton[highlightView]].caption:SetTextColor(1,.9,0,1)
@@ -5122,35 +4598,6 @@ local function Refresh(self, force, report)
                 end
             end
             self.segment = filtered
-        end
-    elseif isPlaybackView then
-        -- 动作回放：当前/近期/BOSS 专用数据源
-        if isBossView then
-            if ShaguDPS.pendingBossRecord then
-                -- BOSS 战中：使用实时当前战斗回放
-                self.segment = ShaguDPS.cached_current_playback or data.playback[1]
-            elseif currentBossFight then
-                if ShaguDPS_Playback.boss and ShaguDPS_Playback.boss[ShaguDPS.current_boss_index] then
-                    self.segment = ShaguDPS_Playback.boss[ShaguDPS.current_boss_index]
-                else
-                    self.segment = {}
-                end
-            else
-                self.segment = {}
-            end
-        elseif isRecentFightView then
-            if currentRecentFight then
-                local idx = config[wid].recent_fight_index or ShaguDPS.current_recent_index
-                if ShaguDPS_Playback.recent and ShaguDPS_Playback.recent[idx] then
-                    self.segment = ShaguDPS_Playback.recent[idx]
-                else
-                    self.segment = {}
-                end
-            else
-                self.segment = {}
-            end
-        else
-            self.segment = ShaguDPS.cached_current_playback or data.playback[1]
         end
     elseif isRecentFightView then
         if currentRecentFight then
@@ -6061,11 +5508,7 @@ local function CreateWindow(wid)
         local curView = config[wid] and config[wid].view or 1
         for _, viewId in ipairs(ShaguDPS.rightStatViews) do
             if ShaguDPS.IsStatEnabled(viewId) then
-                if viewId == 25 and not ShaguDPS.IsPlaybackViewApplicable(segType, curView) then
-                    -- 动作回放仅在当前/近期/BOSS战可选
-                else
-                    table.insert(enabledViews, viewId)
-                end
+                table.insert(enabledViews, viewId)
             end
         end
 
@@ -6148,7 +5591,7 @@ local function CreateWindow(wid)
     frame.btnMode.caption:SetFont(STANDARD_TEXT_FONT, 9)
     frame.btnMode.caption:SetText("伤害量")
     frame.btnMode.caption:SetAllPoints()
-    frame.btnMode.tooltip = { "选择统计类型", "|cffffffff伤害量, DPS, 治疗量, HPS, 仇恨" .. (ShaguDPS.hasNampower and ", 有效治疗, 过量治疗, 死亡, 技能施放, 误伤, 驱散, 破甲, 承受伤害, 能量回复, 无效伤害, 受到治疗, 复活, 光环覆盖, 动作回放" or "") }
+    frame.btnMode.tooltip = { "选择统计类型", "|cffffffff伤害量, DPS, 治疗量, HPS, 仇恨" .. (ShaguDPS.hasNampower and ", 有效治疗, 过量治疗, 死亡, 技能施放, 误伤, 驱散, 破甲, 承受伤害, 能量回复, 无效伤害, 受到治疗, 复活, 光环覆盖, 打断, 敌人承伤, 易伤覆盖" or "") }
     frame.btnMode:SetScript("OnEnter", btnEnter)
     frame.btnMode:SetScript("OnLeave", btnLeave)
     frame.btnMode:SetScript("OnClick", function()

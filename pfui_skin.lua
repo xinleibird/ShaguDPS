@@ -398,7 +398,6 @@ local function ApplyPfuiSkinToWindow(win)
         table.insert(buttons, win.btnInterrupt)
         table.insert(buttons, win.btnEnemyTaken)
         table.insert(buttons, win.btnVulnCov)
-        table.insert(buttons, win.btnPlayback)
         if win.btnBossPrev then table.insert(buttons, win.btnBossPrev) end
         if win.btnBossNext then table.insert(buttons, win.btnBossNext) end
         if win.btnBossMenu then table.insert(buttons, win.btnBossMenu) end
