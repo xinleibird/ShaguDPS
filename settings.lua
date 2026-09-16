@@ -451,10 +451,14 @@ if ShaguDPS.hasNampower then
     leftPanel:CreateConfig("剔除小动物伤害", "exclude_critters", "boolean")
     leftPanel:CreateConfig("剔除队友误伤", "hide_friendly_damage", "boolean")
     leftPanel:CreateConfig("仅统计战斗治疗", "heal_only_in_combat", "boolean")
-    leftPanel:CreateConfig("非战斗/非队伍时隐藏仇恨窗口", "hide_nondefault_threat_out_of_combat", "boolean")
-    leftPanel:CreateConfig("仇恨仅显示坦克和自己", "show_only_tank_and_self_in_threat", "boolean")
     leftPanel:CreateConfig("分开统计主副手伤害", "separate_mh_oh_damage", "boolean")
 end
+
+leftPanel:CreateConfig("仇恨", nil, "header")
+leftPanel:CreateConfig("仇恨警告阈值", "threat_aggro_threshold", "number", {min=50, max=100, step=5})
+leftPanel:CreateConfig("仇恨达阈值时播放警告声", "threat_aggro_sound", "boolean")
+leftPanel:CreateConfig("仇恨仅显示坦克和自己", "show_only_tank_and_self_in_threat", "boolean")
+leftPanel:CreateConfig("非战斗/非队伍时隐藏仇恨窗口", "hide_nondefault_threat_out_of_combat", "boolean")
 
 leftPanel:CreateConfig("窗口", nil, "header")
 leftPanel:CreateConfig("条材质", "texture", ShaguDPS.textures)

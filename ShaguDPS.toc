@@ -17,6 +17,9 @@ core.lua
 parser.lua
 parser-vanilla.lua
 
+# 仇恨警告声（被动监听 data.threat，依赖 parser）
+threat_alert.lua
+
 # 界面模块
 window.lua
 pfui_skin.lua

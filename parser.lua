@@ -4195,6 +4195,10 @@ local function parseThreatPacket(msg)
     end
     for id, callback in pairs(parser.callbacks.refresh) do callback() end
 
+    if ShaguDPS.threatAlert and ShaguDPS.threatAlert.Update then
+        ShaguDPS.threatAlert:Update()
+    end
+
     -- 收到仇恨数据时，若处于战斗且存在隐藏的仇恨视图窗口，则显示
     if ShaguDPS.window and ShaguDPS.Combat() then
         for i = 1, 10 do
