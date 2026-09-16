@@ -49,7 +49,7 @@ function threatAlert:Update()
     local myThreat = threatTable[playerName]
     if not myThreat or not myThreat.perc then return end
 
-    local threshold = ShaguDPS.config.threat_aggro_threshold or 90
+    local threshold = ShaguDPS.config.threat_aggro_threshold or 85
     if myThreat.perc < threshold then return end
 
     local now = GetTime()
