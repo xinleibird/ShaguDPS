@@ -28,6 +28,11 @@ parser.badDispelClearTimes = {}
 -- 刷新回调表（由 window.lua 注册，战斗事件处理后统一触发，刷新显示）
 parser.callbacks = { ["refresh"] = {} }
 
+-- 全局事件时间戳：战斗事件触发时设为 GetTime()。
+-- 窗口 OnUpdate 0.2s 节流后比较"上次本地 Refresh 时间戳"与本值，
+-- 若有更新则 Refresh 并更新本地时间戳（避免脏标志被抢先清零导致多窗口只刷一个）
+parser.lastRefreshEventTime = 0
+
 -- 统计启用状态（根据配置动态更新）
 parser.enabled = {
     damage = true,
@@ -1110,7 +1115,7 @@ local function updateStats(source, action, target, value, school, datatype, effe
         end
     end
 
-    for id, callback in pairs(parser.callbacks.refresh) do callback() end
+    parser.lastRefreshEventTime = GetTime()
 end
 
 parser.AddData = function(self, source, action, target, value, school, datatype)
@@ -1335,7 +1340,7 @@ local function recordDotTick(source, action, ownerName)
         if not entry[finalSource] then entry[finalSource] = {} end
         entry[finalSource][finalAction] = (entry[finalSource][finalAction] or 0) + 1
     end
-    for id, callback in pairs(parser.callbacks.refresh) do callback() end
+    parser.lastRefreshEventTime = GetTime()
 end
 
 -- ============================================================================
@@ -1458,7 +1463,7 @@ local function updateEnergizeStats(source, action, target, amount, powerType, ow
         end
     end
 
-    for id, callback in pairs(parser.callbacks.refresh) do callback() end
+    parser.lastRefreshEventTime = GetTime()
 end
 
 -- ============================================================================
@@ -1509,7 +1514,7 @@ local function addInvalidDamage(source, action, target, value, school, overkill)
         end
     end
 
-    for id, callback in pairs(parser.callbacks.refresh) do callback() end
+    parser.lastRefreshEventTime = GetTime()
 end
 
 -- ============================================================================
@@ -1748,7 +1753,7 @@ local function RecordWrongDispel(casterName, targetName, debuffName, spellName)
             (p["错误驱散"][targetName][debuffName] or 0) + 1
     end
 
-    for id, callback in pairs(parser.callbacks.refresh) do callback() end
+    parser.lastRefreshEventTime = GetTime()
 end
 
 local function CheckWrongDispelOnSpellGo(spellName, casterGuid, targetGuid, finalName)
@@ -2509,7 +2514,7 @@ local function updateHealTaken(victimName, sourceName, amount, effectiveAmount)
         vRec[sourceName]._sum = vRec[sourceName]._sum + amount
         vRec[sourceName]._esum = vRec[sourceName]._esum + effective
     end
-    for id, callback in pairs(parser.callbacks.refresh) do callback() end
+    parser.lastRefreshEventTime = GetTime()
 end
 
 local function recordDamageTaken(targetGuid, sourceName, spellName, damage, hitType)
@@ -2739,7 +2744,7 @@ local function onUnitDied(guid)
         queuedTime = GetTime(),
     })
 
-    for id, callback in pairs(parser.callbacks.refresh) do callback() end
+    parser.lastRefreshEventTime = GetTime()
 end
 
 -- ============================================================================
@@ -2799,7 +2804,7 @@ local function updateReviveStats(source, target, ownerName)
         currRec._total = (currRec._total or 0) + 1
         currRec[target] = (currRec[target] or 0) + 1
     end
-    for id, callback in pairs(parser.callbacks.refresh) do callback() end
+    parser.lastRefreshEventTime = GetTime()
 end
 
 -- ============================================================================
@@ -2852,7 +2857,7 @@ local function addInterrupt(interrupterName, interruptSpellName, victimName, vic
         v[victimSpellName] = (v[victimSpellName] or 0) + 1
     end
 
-    for id, callback in pairs(parser.callbacks.refresh) do callback() end
+    parser.lastRefreshEventTime = GetTime()
 end
 
 local function TryMatchFailure(fail)
@@ -4046,7 +4051,7 @@ if ShaguDPS.hasNampower then
             end
         end
 
-        for id, callback in pairs(parser.callbacks.refresh) do callback() end
+        parser.lastRefreshEventTime = GetTime()
     end
 
     -- ----------------------------------------------------------------------------
@@ -4197,7 +4202,7 @@ if ShaguDPS.hasNampower then
         elseif event == "SPELL_FAILED_OTHER" then
             onSpellFailedOther(arg1, arg2)
         end
-        for id, callback in pairs(parser.callbacks.refresh) do callback() end
+        parser.lastRefreshEventTime = GetTime()
     end)
 
     parser:UpdateEnabledStats()
@@ -4264,7 +4269,7 @@ local function parseThreatPacket(msg)
             }
         end
     end
-    for id, callback in pairs(parser.callbacks.refresh) do callback() end
+    parser.lastRefreshEventTime = GetTime()
 
     if ShaguDPS.threatAlert and ShaguDPS.threatAlert.Update then
         ShaguDPS.threatAlert:Update()
@@ -4295,7 +4300,7 @@ threatEventFrame:SetScript("OnEvent", function()
         end
     elseif event == "PLAYER_TARGET_CHANGED" then
         data.threat = {}
-        for id, callback in pairs(parser.callbacks.refresh) do callback() end
+        parser.lastRefreshEventTime = GetTime()
     end
 end)
 

@@ -4145,6 +4145,9 @@ end
 local function Refresh(self, force, report)
     if not self or type(self) == "boolean" then return end
     self:SetScale(config.scale)
+    -- 同步本地时间戳到当前全局值，避免手动 frame:Refresh(true)（按钮点击等）
+    -- 之后 OnUpdate 因 lastRefreshTime 已最新而不再重复刷新
+    self.lastRefreshTime = parser.lastRefreshEventTime
     local values, buttons = self.values, self.buttons
     local wid = self:GetID()
 
@@ -5191,8 +5194,11 @@ local function CreateWindow(wid)
                 this:SetTitleShown(true)
             end
         end
-        if this.needs_refresh then
-            this.needs_refresh = nil
+        -- 检查全局事件时间戳：若比上次本地 Refresh 更晚，则 Refresh 并更新本地戳
+        -- （取代原 callbacks.refresh 循环：每事件 130 次 callback → 0 次）
+        local evtTime = parser.lastRefreshEventTime
+        if evtTime > (this.lastRefreshTime or 0) then
+            this.lastRefreshTime = evtTime
             this:Refresh()
         end
     end)
@@ -5915,10 +5921,6 @@ local function CreateWindow(wid)
         table.insert(frame.buttons, frame.btnEnemyTaken)
     end
 
-    table.insert(parser.callbacks.refresh, function()
-        frame.needs_refresh = true
-    end)
-
     return frame
 end
 
@@ -5929,9 +5931,13 @@ end
 window[1] = window[1] or CreateWindow(1)
 
 window.Refresh = function(force, report)
+    -- 手动 Refresh(true)（设置变更、ResetData 等）后推进全局时间戳到当前，
+    -- 让所有窗口的 lastRefreshTime 都同步到此值，避免 OnUpdate 重复刷新
+    parser.lastRefreshEventTime = GetTime()
     for i=1,10 do
         if config[i] then
             window[i] = window[i] or CreateWindow(i)
+            window[i].lastRefreshTime = parser.lastRefreshEventTime
             window[i]:Refresh(force, report)
         end
     end
