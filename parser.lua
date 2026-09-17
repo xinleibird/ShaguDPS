@@ -1255,6 +1255,21 @@ local function processAbsorb(targetGuid, spellSchool, absorbAmount)
     if absorbAmount <= 0 or not activeShields[targetGuid] then
         return
     end
+    -- 用户禁用治疗统计时不消耗 shield 数据（避免写被禁用的 data.heal/heal_taken 段）
+    if not (parser.enabled.heal or parser.enabled.heal_taken) then
+        -- 仅清理已耗尽的 shield（避免 activeShields 累积；新 shield 不会再被构造，
+        -- 因为 onBuffAdded 现在受 heal/heal_taken 守卫）
+        local shields = activeShields[targetGuid]
+        for i = table.getn(shields), 1, -1 do
+            if shields[i].maxAbsorb - shields[i].absorbed <= 0 then
+                table.remove(shields, i)
+            end
+        end
+        if table.getn(shields) == 0 then
+            activeShields[targetGuid] = nil
+        end
+        return
+    end
 
     local shields = activeShields[targetGuid]
     local remainingAbsorb = absorbAmount
@@ -1998,6 +2013,9 @@ function parser:initWeaknessCoverage()
 end
 
 function parser:HandleWeaknessTargetDeath(guid, name, deathTime)
+    -- 用户禁用易伤覆盖率时不写入 data.weakness_coverage
+    -- （active 表的清理推迟到 NO_COMBAT 时的 finalizeWeaknessCoverage）
+    if not parser.enabled.weakness_coverage then return end
     if not name or isUnknownName(name) then return end
     if not data.weakness_coverage or not data.weakness_coverage[1] then
         data.weakness_coverage[1] = {}
@@ -2915,6 +2933,24 @@ if ShaguDPS.hasNampower then
     SetCVar("NP_EnableSpellEnergizeEvents", "1")
     SetCVar("NP_EnableSpellGoEvents", "1")
     SetCVar("NP_EnableAuraCastEvents", "1")
+
+    -- 与 enabled 开关无关、必须始终监听的事件（威胁清空、护盾生命周期、
+    -- buff/debuff/易伤 扫描、环境伤害、错误驱散标记 等）。
+    -- 启用与否的精细控制由 OnEvent 分发器中针对各 handler 的 enabled 守卫负责。
+    local function registerAlwaysOnEvents()
+        local ev = {
+                "DAMAGE_SHIELD_SELF", "DAMAGE_SHIELD_OTHER",
+                "AURA_CAST_ON_SELF", "AURA_CAST_ON_OTHER",
+                "BUFF_ADDED_SELF", "BUFF_ADDED_OTHER",
+                "BUFF_REMOVED_SELF", "BUFF_REMOVED_OTHER",
+                "DEBUFF_ADDED_SELF", "DEBUFF_ADDED_OTHER",
+                "DEBUFF_REMOVED_SELF", "DEBUFF_REMOVED_OTHER",
+                "ENVIRONMENTAL_DMG_SELF", "ENVIRONMENTAL_DMG_OTHER",
+                "PLAYER_TARGET_CHANGED", "PLAYER_ENTERING_WORLD",
+            }
+        for _, name in ipairs(ev) do parser:RegisterEvent(name) end
+    end
+    registerAlwaysOnEvents()
 
     -- 误伤统计辅助
     local function recordFriendlyFire(casterGuid, sourceName, targetName, action, damage)
@@ -4016,39 +4052,12 @@ if ShaguDPS.hasNampower then
     -- ----------------------------------------------------------------------------
     -- 28.1 事件注册与 OnEvent 分发（第 28 节子块）
     -- ----------------------------------------------------------------------------
-
-    parser:RegisterEvent("SPELL_DAMAGE_EVENT_SELF")
-    parser:RegisterEvent("SPELL_DAMAGE_EVENT_OTHER")
-    parser:RegisterEvent("AUTO_ATTACK_SELF")
-    parser:RegisterEvent("AUTO_ATTACK_OTHER")
-    parser:RegisterEvent("SPELL_MISS_SELF")
-    parser:RegisterEvent("SPELL_MISS_OTHER")
-    parser:RegisterEvent("SPELL_HEAL_BY_SELF")
-    parser:RegisterEvent("SPELL_HEAL_BY_OTHER")
-    parser:RegisterEvent("DAMAGE_SHIELD_SELF")
-    parser:RegisterEvent("DAMAGE_SHIELD_OTHER")
-    parser:RegisterEvent("UNIT_DIED")
-    parser:RegisterEvent("SPELL_GO_SELF")
-    parser:RegisterEvent("SPELL_GO_OTHER")
-    parser:RegisterEvent("SPELL_DISPEL_BY_SELF")
-    parser:RegisterEvent("SPELL_DISPEL_BY_OTHER")
-    parser:RegisterEvent("PLAYER_TARGET_CHANGED")
-    parser:RegisterEvent("PLAYER_ENTERING_WORLD")
-    parser:RegisterEvent("AURA_CAST_ON_SELF")
-    parser:RegisterEvent("AURA_CAST_ON_OTHER")
-    parser:RegisterEvent("BUFF_ADDED_SELF")
-    parser:RegisterEvent("BUFF_ADDED_OTHER")
-    parser:RegisterEvent("BUFF_REMOVED_SELF")
-    parser:RegisterEvent("BUFF_REMOVED_OTHER")
-    parser:RegisterEvent("DEBUFF_REMOVED_SELF")
-    parser:RegisterEvent("DEBUFF_REMOVED_OTHER")
-    parser:RegisterEvent("DEBUFF_ADDED_SELF")
-    parser:RegisterEvent("DEBUFF_ADDED_OTHER")
-    parser:RegisterEvent("ENVIRONMENTAL_DMG_SELF")
-    parser:RegisterEvent("ENVIRONMENTAL_DMG_OTHER")
-    parser:RegisterEvent("SPELL_ENERGIZE_BY_SELF")
-    parser:RegisterEvent("SPELL_ENERGIZE_BY_OTHER")
-    parser:RegisterEvent("SPELL_FAILED_OTHER")
+    -- 注意：事件注册已拆分为两部分，避免与 RefreshEventRegistration 重复：
+    --   1) 与 enabled 开关有关的事件 → 由 parser:RefreshEventRegistration() 管理
+    --      （见上方第 1 节 UpdateEnabledStats → RefreshEventRegistration）。
+    --   2) 与 enabled 开关无关的事件 → 由 registerAlwaysOnEvents() 在 hasNampower
+    --      块开头一次性注册。
+    -- 此处不再重复 RegisterEvent。
 
     local currentTargetGUID = nil
 
@@ -4068,9 +4077,21 @@ if ShaguDPS.hasNampower then
         elseif event == "SPELL_HEAL_BY_OTHER" then
             onSpellHealByOther(arg1, arg2, arg3, arg4, arg5, arg6)
         elseif event == "DAMAGE_SHIELD_SELF" then
-            onDamageShieldSelf(arg1, arg2, arg3, arg4)
+            -- onDamageShieldSelf 写入 damage/friendly_fire/damage_taken/
+            -- enemy_damage_taken/invalid_damage/heal/heal_taken；任一启用才处理
+            if parser.enabled.damage or parser.enabled.friendly_fire
+                    or parser.enabled.damage_taken or parser.enabled.enemy_damage_taken
+                    or parser.enabled.invalid_damage
+                    or parser.enabled.heal or parser.enabled.heal_taken then
+                onDamageShieldSelf(arg1, arg2, arg3, arg4)
+            end
         elseif event == "DAMAGE_SHIELD_OTHER" then
-            onDamageShieldOther(arg1, arg2, arg3, arg4)
+            if parser.enabled.damage or parser.enabled.friendly_fire
+                    or parser.enabled.damage_taken or parser.enabled.enemy_damage_taken
+                    or parser.enabled.invalid_damage
+                    or parser.enabled.heal or parser.enabled.heal_taken then
+                onDamageShieldOther(arg1, arg2, arg3, arg4)
+            end
         elseif event == "UNIT_DIED" then
             onUnitDied(arg1)
             if arg1 == "target" or (currentTargetGUID and arg1 == currentTargetGUID) then
@@ -4079,14 +4100,18 @@ if ShaguDPS.hasNampower then
             end
         elseif event == "SPELL_GO_SELF" then
             onSpellGo(arg1, arg2, arg3, arg4, arg5, arg6, arg7, arg8)
-            local spellName = getSpellName(arg2)
-            local casterName = SafeUnitName("player")
-            CheckWrongDispelOnSpellGo(spellName, "player", arg4, casterName)
+            if parser.enabled.dispel then
+                local spellName = getSpellName(arg2)
+                local casterName = SafeUnitName("player")
+                CheckWrongDispelOnSpellGo(spellName, "player", arg4, casterName)
+            end
         elseif event == "SPELL_GO_OTHER" then
             onSpellGo(arg1, arg2, arg3, arg4, arg5, arg6, arg7, arg8)
-            local spellName = getSpellName(arg2)
-            local casterName = SafeUnitName(arg3)
-            CheckWrongDispelOnSpellGo(spellName, arg3, arg4, casterName)
+            if parser.enabled.dispel then
+                local spellName = getSpellName(arg2)
+                local casterName = SafeUnitName(arg3)
+                CheckWrongDispelOnSpellGo(spellName, arg3, arg4, casterName)
+            end
         elseif event == "SPELL_DISPEL_BY_SELF" or event == "SPELL_DISPEL_BY_OTHER" then
             onDispel(arg1, arg2, arg3)
         elseif event == "PLAYER_TARGET_CHANGED" then
@@ -4097,28 +4122,74 @@ if ShaguDPS.hasNampower then
         elseif event == "PLAYER_ENTERING_WORLD" then
             -- 进入世界/换地图/传送时无需额外操作（数据段管理由 combat 状态机负责）
         elseif event == "AURA_CAST_ON_SELF" or event == "AURA_CAST_ON_OTHER" then
-            onAuraCast(arg1, arg2, arg3, arg4, arg5, arg6, arg7, arg8, arg9)
-        elseif event == "BUFF_REMOVED_SELF" or event == "BUFF_REMOVED_OTHER" or event == "DEBUFF_REMOVED_SELF" or event == "DEBUFF_REMOVED_OTHER" then
-            onBuffRemoved(arg1, arg2, arg3, arg4, arg5, arg6, arg7)
-            local auraType = string.find(event, "DEBUFF") and "debuff" or "buff"
-            parser:handleBuffRemove(arg1, arg3, arg7, auraType)
-            if ShaguDPS.badDispelDebuffs[getSpellName(arg3)] then
-                UnmarkBadDispelDebuff(arg1, arg3)
+            -- AURA_CAST 同时支撑命中明细(E.damage/invalid_damage)、易伤扫描(E.weakness_coverage)、
+            -- 护盾生命周期(E.heal/heal_taken)；任一启用时才需要处理
+            if parser.enabled.damage or parser.enabled.invalid_damage
+                    or parser.enabled.weakness_coverage
+                    or parser.enabled.heal or parser.enabled.heal_taken then
+                onAuraCast(arg1, arg2, arg3, arg4, arg5, arg6, arg7, arg8, arg9)
             end
-            parser:handleWeaknessAuraRemove(arg1, arg3, arg7, auraType)
+        elseif event == "BUFF_REMOVED_SELF" or event == "BUFF_REMOVED_OTHER" or event == "DEBUFF_REMOVED_SELF" or event == "DEBUFF_REMOVED_OTHER" then
+            -- 多 handler 共用：onBuffRemoved(护盾,需heal/heal_taken)+handleBuffRemove(buff_coverage)
+            -- +UnmarkBadDispelDebuff(dispel)+handleWeaknessAuraRemove(weakness_coverage)
+            if parser.enabled.heal or parser.enabled.heal_taken
+                    or parser.enabled.buff_coverage or parser.enabled.weakness_coverage
+                    or parser.enabled.dispel then
+                -- 仅 heal/heal_taken 启用时才走 onBuffRemoved（其内部 shieldData 处理
+                -- 会构造 activeShields 对象，若禁用 heal/heal_taken 时仍构造，
+                -- 会因 DAMAGE_SHIELD 被守卫跳过而 processAbsorb 不调用，造成内存累积）
+                if parser.enabled.heal or parser.enabled.heal_taken then
+                    onBuffRemoved(arg1, arg2, arg3, arg4, arg5, arg6, arg7)
+                end
+                local auraType = string.find(event, "DEBUFF") and "debuff" or "buff"
+                if parser.enabled.buff_coverage then
+                    parser:handleBuffRemove(arg1, arg3, arg7, auraType)
+                end
+                if parser.enabled.dispel and ShaguDPS.badDispelDebuffs[getSpellName(arg3)] then
+                    UnmarkBadDispelDebuff(arg1, arg3)
+                end
+                if parser.enabled.weakness_coverage then
+                    parser:handleWeaknessAuraRemove(arg1, arg3, arg7, auraType)
+                end
+            end
         elseif event == "DEBUFF_ADDED_SELF" or event == "DEBUFF_ADDED_OTHER" then
-            onBuffAdded(arg1, arg2, arg3, arg4, arg5, arg6, arg7)
-            parser:handleBuffAdd(arg1, arg3, arg7, "debuff")
-            MarkBadDispelDebuff(arg1, arg3)
-            parser:handleWeaknessAuraAdd(arg1, arg3, arg7, "debuff")
+            if parser.enabled.heal or parser.enabled.heal_taken
+                    or parser.enabled.buff_coverage or parser.enabled.weakness_coverage
+                    or parser.enabled.dispel then
+                if parser.enabled.heal or parser.enabled.heal_taken then
+                    onBuffAdded(arg1, arg2, arg3, arg4, arg5, arg6, arg7)
+                end
+                if parser.enabled.buff_coverage then
+                    parser:handleBuffAdd(arg1, arg3, arg7, "debuff")
+                end
+                if parser.enabled.dispel then
+                    MarkBadDispelDebuff(arg1, arg3)
+                end
+                if parser.enabled.weakness_coverage then
+                    parser:handleWeaknessAuraAdd(arg1, arg3, arg7, "debuff")
+                end
+            end
         elseif event == "BUFF_ADDED_SELF" or event == "BUFF_ADDED_OTHER" then
-            onBuffAdded(arg1, arg2, arg3, arg4, arg5, arg6, arg7)
-            parser:handleBuffAdd(arg1, arg3, arg7, "buff")
-            parser:handleWeaknessAuraAdd(arg1, arg3, arg7, "buff")
+            if parser.enabled.heal or parser.enabled.heal_taken
+                    or parser.enabled.buff_coverage or parser.enabled.weakness_coverage then
+                if parser.enabled.heal or parser.enabled.heal_taken then
+                    onBuffAdded(arg1, arg2, arg3, arg4, arg5, arg6, arg7)
+                end
+                if parser.enabled.buff_coverage then
+                    parser:handleBuffAdd(arg1, arg3, arg7, "buff")
+                end
+                if parser.enabled.weakness_coverage then
+                    parser:handleWeaknessAuraAdd(arg1, arg3, arg7, "buff")
+                end
+            end
         elseif event == "ENVIRONMENTAL_DMG_SELF" then
-            onEnvironmentalDmgSelf(arg1, arg2, arg3, arg4, arg5)
+            if parser.enabled.damage_taken then
+                onEnvironmentalDmgSelf(arg1, arg2, arg3, arg4, arg5)
+            end
         elseif event == "ENVIRONMENTAL_DMG_OTHER" then
-            onEnvironmentalDmgOther(arg1, arg2, arg3, arg4, arg5)
+            if parser.enabled.damage_taken then
+                onEnvironmentalDmgOther(arg1, arg2, arg3, arg4, arg5)
+            end
         elseif event == "SPELL_ENERGIZE_BY_SELF" then
             onSpellEnergizeBySelf(arg1, arg2, arg3, arg4, arg5, arg6)
         elseif event == "SPELL_ENERGIZE_BY_OTHER" then
