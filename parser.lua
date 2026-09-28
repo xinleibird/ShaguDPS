@@ -19,8 +19,10 @@ local data = ShaguDPS.data
 local config = ShaguDPS.config
 local round = ShaguDPS.round
 
--- 死亡回放延迟队列初始化
-parser.deathReplayQueue = {}
+-- 节流/延迟间隔（秒），集中定义便于调优
+local ONUPDATE_INTERVAL = 0.1       -- parser OnUpdate 函数体节流
+local COMBAT_TICK_INTERVAL = 0.2    -- combat 帧 OnUpdate（状态检查）节流
+local PENDING_EVENT_DELAY = 0.5     -- pendingEvents 未知名称的延迟解析
 
 -- 危险debuff标记延迟清除表：[guid] = 应清除时间
 parser.badDispelClearTimes = {}
@@ -118,13 +120,13 @@ local function SafeUnitName(guid)
     return UnitName(guid)
 end
 
-local function deepcopy(original)
-    if type(original) ~= "table" then return original end
-    local copy = {}
-    for k, v in pairs(original) do
-        copy[k] = deepcopy(v)
+-- 玩家名会话内不变，缓存避免事件热路径重复调用 UnitName（首个单位就绪前返回 nil 并重试）
+local playerNameCache = nil
+local function PlayerName()
+    if not playerNameCache then
+        playerNameCache = UnitName("player")
     end
-    return copy
+    return playerNameCache
 end
 
 local function IsFriendly(guid)
@@ -157,7 +159,7 @@ function parser:ScheduleEvent(func, args, guids)
         createTime = now,
     }
     if self.nextProcessTime == 0 then
-        self.nextProcessTime = now + 0.5
+        self.nextProcessTime = now + PENDING_EVENT_DELAY
     end
 end
 
@@ -190,26 +192,26 @@ local function processPendingEvents()
         end
     end
     if anyRemaining then
-        parser.nextProcessTime = now + 0.5
+        parser.nextProcessTime = now + PENDING_EVENT_DELAY
     else
         parser.nextProcessTime = 0
     end
 end
 parser.processPendingEvents = processPendingEvents
 
--- 帧更新脚本，统一处理三类延迟任务：
+-- 帧更新脚本，统一处理两类延迟任务：
 --  1) pendingEvents 未知名称延迟解析（第 3 节）
---  2) 死亡回放延迟队列（第 25 节）
---  3) 危险 debuff 标记延迟清除（第 19 节）
+--  2) 危险 debuff 标记延迟清除（第 19 节）
+-- 0.1s 节流：避免每帧都执行函数体（原先每帧一次 GetTime + next 调用）
+parser.throttleTick = 0
 parser:SetScript("OnUpdate", function()
-    if parser.nextProcessTime ~= 0 and GetTime() >= parser.nextProcessTime then
+    local now = GetTime()
+    if now < (parser.throttleTick or 0) then return end
+    parser.throttleTick = now + (config.onupdate_interval or ONUPDATE_INTERVAL)
+    if parser.nextProcessTime ~= 0 and now >= parser.nextProcessTime then
         processPendingEvents()
     end
-    if parser.ProcessDeathReplayQueue and next(parser.deathReplayQueue) then
-        parser:ProcessDeathReplayQueue(false)
-    end
     if next(parser.badDispelClearTimes) then
-        local now = GetTime()
         for guid, clearTime in pairs(parser.badDispelClearTimes) do
             if now >= clearTime then
                 if ShaguDPS.activeBadDispelDebuffs then
@@ -350,7 +352,6 @@ local function resetCurrentSegment()
     data["weakness_coverage"][1] = {}
     data["interrupt"][1] = {}
     data["enemy_damage_taken"][1] = {}
-    data.death_replays = {}
     parser.extraAttacks = {}
     ShaguDPS.activeBadDispelDebuffs = {}
     ShaguDPS.wrongDispels = {}
@@ -403,6 +404,54 @@ local function mergeEnemyDamageTaken(target, source)
                 end
                 tt[sourceName]._sum = (tt[sourceName]._sum or 0) + (sdata._sum or 0)
                 tt[sourceName]._overkill = (tt[sourceName]._overkill or 0) + (sdata._overkill or 0)
+            end
+        end
+    end
+end
+
+-- 将 src（单位 _history 列表）按 source|spell 去重合并进 dst 的 _history（复用 _historyIdx 索引）。
+-- small_fight 跨战斗累计时同源同技能只保留一条并累加 total，避免历史随战斗场次无限膨胀。
+-- 新条目一律复制字段而非共享引用（dst 条目需可被合并修改）。
+local MAX_SMALL_DAMAGE_TAKEN_HISTORY = 500
+local function mergeDamageTakenHistory(dst, src)
+    if not src then return end
+    local h = dst._history
+    local idx = dst._historyIdx
+    if not idx then
+        -- 兼容旧存档：无索引则按现有条目重建
+        idx = {}
+        dst._historyIdx = idx
+        for pos = 1, table.getn(h) do
+            local e = h[pos]
+            if e then idx[(e.source or "") .. "|" .. (e.spell or "")] = pos end
+        end
+    end
+    for i = 1, table.getn(src) do
+        local s = src[i]
+        if s then
+            local key = (s.source or "") .. "|" .. (s.spell or "")
+            local pos = idx[key]
+            local d = pos and h[pos]
+            if d then
+                d.total = d.total + (s.total or 0)
+                d.last = s.last or d.last
+                if (s.time or 0) > (d.time or 0) then d.time = s.time end
+            else
+                local n = table.getn(h) + 1
+                h[n] = { source = s.source, spell = s.spell, total = s.total or 0, last = s.last or 0, time = s.time or 0 }
+                idx[key] = n
+                if n > MAX_SMALL_DAMAGE_TAKEN_HISTORY then
+                    for k, v in pairs(idx) do
+                        if v == 1 then
+                            idx[k] = nil
+                            break
+                        end
+                    end
+                    table.remove(h, 1)
+                    for k, v in pairs(idx) do
+                        idx[k] = v - 1
+                    end
+                end
             end
         end
     end
@@ -554,13 +603,11 @@ local function mergeCurrentToSmallFight()
 
     -- 合并承受伤害
     for name, unitdata in pairs(data.damage_taken[1]) do
-        if not small.damage_taken[name] then small.damage_taken[name] = { ["_sum"] = 0, ["_history"] = {} } end
-        small.damage_taken[name]["_sum"] = (small.damage_taken[name]["_sum"] or 0) + (unitdata._sum or 0)
-        if unitdata._history then
-            for _, h in ipairs(unitdata._history) do
-                table.insert(small.damage_taken[name]["_history"], h)
-            end
+        if not small.damage_taken[name] then
+            small.damage_taken[name] = { ["_sum"] = 0, ["_history"] = {}, ["_historyIdx"] = {} }
         end
+        small.damage_taken[name]["_sum"] = (small.damage_taken[name]["_sum"] or 0) + (unitdata._sum or 0)
+        mergeDamageTakenHistory(small.damage_taken[name], unitdata._history)
     end
 
     -- 合并敌人承伤
@@ -724,6 +771,24 @@ local function mergeCurrentToSmallFight()
     ShaguDPS.small_fight_total_time = (ShaguDPS.small_fight_total_time or 0) + data.last_fight_duration
 end
 
+-- 最近战斗名称统一编号为"1. 最新 … N. 最旧"（新增/删除后均可安全重跑）。
+-- bossName 恒存在；缺失时先剥掉旧数字前缀，避免重复叠加
+local function RenumberRecentFights()
+    local fights = ShaguDPS.recent_fights or {}
+    local count = table.getn(fights)
+    for i = 1, count do
+        local fight = fights[count - i + 1]
+        if fight then
+            local base = fight.bossName
+            if not base then
+                base = string.gsub(fight.name or "", "^%d+%.%s*", "")
+            end
+            fight.name = i .. ". " .. base
+        end
+    end
+end
+ShaguDPS.RenumberRecentFights = RenumberRecentFights
+
 -- 将当前战斗（伤害/治疗段 1）保存为"最近战斗"快照（最多保留 5 场）。
 -- 条件：有伤害或治疗数据，且战斗时长 ≥ 10 秒。
 -- 名称取本场战斗血量最高的敌人（近似判断 BOSS 名）。
@@ -749,42 +814,32 @@ local function storeRecentFight()
         bossName = bossName,
         timestamp = combat_start_time,
         duration = data.last_fight_duration,
-        damage = deepcopy(data.damage[1]),
-        heal = deepcopy(data.heal[1]),
-        death = deepcopy(data.death[1]),
-        spellcast = deepcopy(data.spellcast[1]),
-        spellcast_details = deepcopy(data.spellcast_details[1]),
-        friendly_fire = deepcopy(data.friendly_fire[1]),
-        dispel = deepcopy(data.dispel[1]),
-        sunder = deepcopy(data.sunder[1]),
-        damage_taken = deepcopy(data.damage_taken[1]),
-        enemy_damage_taken = deepcopy(data.enemy_damage_taken[1]),
-        energize = deepcopy(data.energize[1]),
-        invalid_damage = deepcopy(data.invalid_damage[1]),
-        heal_taken = deepcopy(data.heal_taken[1]),
-        dot_ticks = deepcopy(data.dot_ticks[1]),
-        hit_breakdown = deepcopy(data.hit_breakdown[1]),
-        revive = deepcopy(data.revive[1]),
-        buff_coverage = deepcopy(data.buff_coverage[1]),
-        weakness_coverage = deepcopy(data.weakness_coverage[1]),
-        interrupt = deepcopy(data.interrupt[1]),
-        death_timestamps = deepcopy(data.death_timestamps),
-        death_replays = deepcopy(data.death_replays),
+        damage = data.damage[1],
+        heal = data.heal[1],
+        death = data.death[1],
+        spellcast = data.spellcast[1],
+        spellcast_details = data.spellcast_details[1],
+        friendly_fire = data.friendly_fire[1],
+        dispel = data.dispel[1],
+        sunder = data.sunder[1],
+        damage_taken = data.damage_taken[1],
+        enemy_damage_taken = data.enemy_damage_taken[1],
+        energize = data.energize[1],
+        invalid_damage = data.invalid_damage[1],
+        heal_taken = data.heal_taken[1],
+        dot_ticks = data.dot_ticks[1],
+        hit_breakdown = data.hit_breakdown[1],
+        revive = data.revive[1],
+        buff_coverage = data.buff_coverage[1],
+        weakness_coverage = data.weakness_coverage[1],
+        interrupt = data.interrupt[1],
     }
     table.insert(ShaguDPS.recent_fights, recentFight)
     while table.getn(ShaguDPS.recent_fights) > 5 do
         table.remove(ShaguDPS.recent_fights, 1)
     end
-    local count = table.getn(ShaguDPS.recent_fights)
-    for i = 1, count do
-        local idx = count - i + 1
-        local fight = ShaguDPS.recent_fights[idx]
-        if fight then
-            local baseName = fight.bossName or fight.name
-            fight.name = i .. ". " .. baseName
-        end
-    end
-    ShaguDPS.current_recent_index = count
+    RenumberRecentFights()
+    ShaguDPS.current_recent_index = table.getn(ShaguDPS.recent_fights)
 end
 
 -- ============================================================================
@@ -838,74 +893,58 @@ function parser.combat:UpdateState(forceNoCombat)
             is_boss_encounter = false
 
             healthCache = {}
-            if next(data.damage[1]) then ShaguDPS.cached_current_damage = deepcopy(data.damage[1]) end
-            if next(data.heal[1]) then ShaguDPS.cached_current_heal = deepcopy(data.heal[1]) end
-            if next(data.death[1]) then ShaguDPS.cached_current_death = deepcopy(data.death[1]) end
-            if next(data.spellcast[1]) then ShaguDPS.cached_current_spellcast = deepcopy(data.spellcast[1]) end
-            if next(data.spellcast_details[1]) then ShaguDPS.cached_current_spellcast_details = deepcopy(data.spellcast_details[1]) end
-            if next(data.friendly_fire[1]) then ShaguDPS.cached_current_friendly_fire = deepcopy(data.friendly_fire[1]) end
-            if next(data.dispel[1]) then ShaguDPS.cached_current_dispel = deepcopy(data.dispel[1]) end
-            if next(data.sunder[1]) then ShaguDPS.cached_current_sunder = deepcopy(data.sunder[1]) end
-            if next(data.damage_taken[1]) then ShaguDPS.cached_current_damage_taken = deepcopy(data.damage_taken[1]) end
-            if next(data.enemy_damage_taken[1]) then ShaguDPS.cached_current_enemy_damage_taken = deepcopy(data.enemy_damage_taken[1]) end
-            if next(data.energize[1]) then ShaguDPS.cached_current_energize = deepcopy(data.energize[1]) end
-            if next(data.invalid_damage[1]) then ShaguDPS.cached_current_invalid_damage = deepcopy(data.invalid_damage[1]) end
-            if next(data.heal_taken[1]) then ShaguDPS.cached_current_heal_taken = deepcopy(data.heal_taken[1]) end
-            if next(data.dot_ticks[1]) then ShaguDPS.cached_current_dot_ticks = deepcopy(data.dot_ticks[1]) end
-            if next(data.hit_breakdown[1]) then ShaguDPS.cached_current_hit_breakdown = deepcopy(data.hit_breakdown[1]) end
-            if next(data.revive[1]) then ShaguDPS.cached_current_revive = deepcopy(data.revive[1]) end
-            if next(data.buff_coverage[1]) then ShaguDPS.cached_current_buff_coverage = deepcopy(data.buff_coverage[1]) end
-            if next(data.weakness_coverage[1]) then ShaguDPS.cached_current_weakness_coverage = deepcopy(data.weakness_coverage[1]) end
-            if next(data.interrupt[1]) then ShaguDPS.cached_current_interrupt = deepcopy(data.interrupt[1]) end
-            if next(data.death_replays) then ShaguDPS.cached_current_death_replays = deepcopy(data.death_replays) end
+            -- 直接搬引用代替 deepcopy：
+            -- 旧表仍由 cached_* / storeRecentFight / bossFight 持有，
+            -- 等到下面的 resetCurrentSegment() 才把 data.xxx[1] 替换为空表，
+            -- 此后旧表仍活着供"上一场战斗"视图展示
+            if next(data.damage[1]) then ShaguDPS.cached_current_damage = data.damage[1] end
+            if next(data.heal[1]) then ShaguDPS.cached_current_heal = data.heal[1] end
+            if next(data.death[1]) then ShaguDPS.cached_current_death = data.death[1] end
+            if next(data.spellcast[1]) then ShaguDPS.cached_current_spellcast = data.spellcast[1] end
+            if next(data.spellcast_details[1]) then ShaguDPS.cached_current_spellcast_details = data.spellcast_details[1] end
+            if next(data.friendly_fire[1]) then ShaguDPS.cached_current_friendly_fire = data.friendly_fire[1] end
+            if next(data.dispel[1]) then ShaguDPS.cached_current_dispel = data.dispel[1] end
+            if next(data.sunder[1]) then ShaguDPS.cached_current_sunder = data.sunder[1] end
+            if next(data.damage_taken[1]) then ShaguDPS.cached_current_damage_taken = data.damage_taken[1] end
+            if next(data.enemy_damage_taken[1]) then ShaguDPS.cached_current_enemy_damage_taken = data.enemy_damage_taken[1] end
+            if next(data.energize[1]) then ShaguDPS.cached_current_energize = data.energize[1] end
+            if next(data.invalid_damage[1]) then ShaguDPS.cached_current_invalid_damage = data.invalid_damage[1] end
+            if next(data.heal_taken[1]) then ShaguDPS.cached_current_heal_taken = data.heal_taken[1] end
+            if next(data.dot_ticks[1]) then ShaguDPS.cached_current_dot_ticks = data.dot_ticks[1] end
+            if next(data.hit_breakdown[1]) then ShaguDPS.cached_current_hit_breakdown = data.hit_breakdown[1] end
+            if next(data.revive[1]) then ShaguDPS.cached_current_revive = data.revive[1] end
+            if next(data.buff_coverage[1]) then ShaguDPS.cached_current_buff_coverage = data.buff_coverage[1] end
+            if next(data.weakness_coverage[1]) then ShaguDPS.cached_current_weakness_coverage = data.weakness_coverage[1] end
+            if next(data.interrupt[1]) then ShaguDPS.cached_current_interrupt = data.interrupt[1] end
 
             storeRecentFight()
 
             if table.getn(diedBossesThisFight) > 0 and ShaguDPS.pendingBossRecord then
                 local newBosses = diedBossesThisFight
-                local fightDeathTimestamps = {}
-                if ShaguDPS.battleStartDeathTimestamps then
-                    for name, timestamps in pairs(data.death_timestamps) do
-                        local initial = ShaguDPS.battleStartDeathTimestamps[name]
-                        local initialCount = initial and table.getn(initial) or 0
-                        local newTimestamps = {}
-                        for i = initialCount + 1, table.getn(timestamps) do
-                            table.insert(newTimestamps, timestamps[i])
-                        end
-                        if table.getn(newTimestamps) > 0 then
-                            fightDeathTimestamps[name] = newTimestamps
-                        end
-                    end
-                else
-                    fightDeathTimestamps = deepcopy(data.death_timestamps)
-                end
-
                 local bossFight = {
                     name = ShaguDPS.pendingBossRecord.name,
                     timestamp = ShaguDPS.pendingBossRecord.timestamp,
                     bosses = newBosses,
-                    damage = deepcopy(data.damage[1]),
-                    heal = deepcopy(data.heal[1]),
-                    death = deepcopy(data.death[1]),
-                    spellcast = deepcopy(data.spellcast[1]),
-                    spellcast_details = deepcopy(data.spellcast_details[1]),
-                    friendly_fire = deepcopy(data.friendly_fire[1]),
-                    dispel = deepcopy(data.dispel[1]),
-                    sunder = deepcopy(data.sunder[1]),
-                    damage_taken = deepcopy(data.damage_taken[1]),
-                    enemy_damage_taken = deepcopy(data.enemy_damage_taken[1]),
-                    energize = deepcopy(data.energize[1]),
-                    invalid_damage = deepcopy(data.invalid_damage[1]),
-                    heal_taken = deepcopy(data.heal_taken[1]),
-                    dot_ticks = deepcopy(data.dot_ticks[1]),
-                    hit_breakdown = deepcopy(data.hit_breakdown[1]),
+                    damage = data.damage[1],
+                    heal = data.heal[1],
+                    death = data.death[1],
+                    spellcast = data.spellcast[1],
+                    spellcast_details = data.spellcast_details[1],
+                    friendly_fire = data.friendly_fire[1],
+                    dispel = data.dispel[1],
+                    sunder = data.sunder[1],
+                    damage_taken = data.damage_taken[1],
+                    enemy_damage_taken = data.enemy_damage_taken[1],
+                    energize = data.energize[1],
+                    invalid_damage = data.invalid_damage[1],
+                    heal_taken = data.heal_taken[1],
+                    dot_ticks = data.dot_ticks[1],
+                    hit_breakdown = data.hit_breakdown[1],
                     duration = data.last_fight_duration,
-                    revive = deepcopy(data.revive[1]),
-                    buff_coverage = deepcopy(data.buff_coverage[1]),
-                    weakness_coverage = deepcopy(data.weakness_coverage[1]),
-                    interrupt = deepcopy(data.interrupt[1]),
-                    death_replays = deepcopy(data.death_replays),
-                    death_timestamps = fightDeathTimestamps,
+                    revive = data.revive[1],
+                    buff_coverage = data.buff_coverage[1],
+                    weakness_coverage = data.weakness_coverage[1],
+                    interrupt = data.interrupt[1],
                 }
 
                 local replaced = false
@@ -941,9 +980,6 @@ function parser.combat:UpdateState(forceNoCombat)
             diedBossesThisFight = {}
 
             ShaguDPS.SaveDataToCache()
-            if parser.ProcessDeathReplayQueue then
-                parser:ProcessDeathReplayQueue(true)
-            end
             resetCurrentSegment()
             parser:FlushPendingEvents()
             data.threat = {}
@@ -972,13 +1008,15 @@ function parser.combat:UpdateState(forceNoCombat)
             ShaguDPS.cached_current_hit_breakdown = nil
             ShaguDPS.cached_current_buff_coverage = nil
             ShaguDPS.cached_current_interrupt = nil
-            ShaguDPS.cached_current_death_replays = nil
             combat_start_time = GetTime()
             data.combat_start_time = combat_start_time
+            -- 同步标记，避免下方 OnUpdate 的去重块重复触发 initBuff/WeaknessCoverage
+            -- （initBuffCoverage 整体替换 buff_coverage[1]，重复调用会丢弃中间累积的数据；
+            --   ResetData 中途改 combat_start_time 时仍会走 OnUpdate 块重建基线）
+            ShaguDPS._lastCombatStartTime = data.combat_start_time
             ShaguDPS.pendingBossRecord = nil
             diedBossesThisFight = {}
             parser.extraAttacks = {}
-            ShaguDPS.battleStartDeathTimestamps = deepcopy(data.death_timestamps)
             if ShaguDPS.hasNampower and parser.initBuffCoverage then
                 parser:initBuffCoverage()
             end
@@ -1005,7 +1043,7 @@ end)
 
 parser.combat:SetScript("OnUpdate", function()
     local now = GetTime()
-    if (this.tick or 1) > now then return else this.tick = now + 0.2 end
+    if (this.tick or 1) > now then return else this.tick = now + COMBAT_TICK_INTERVAL end
     this:UpdateState()
     ShaguDPS.RefreshHostileTargets()
     if ShaguDPS.Combat() and data.combat_start_time > 0 then
@@ -1149,7 +1187,7 @@ parser.ScanName = function(self, name)
     for unit, _ in pairs(validPets) do
         if UnitExists(unit) and SafeUnitName(unit) == name then
             if strsub(unit, 0, 3) == "pet" then
-                data["classes"][name] = SafeUnitName("player")
+                data["classes"][name] = PlayerName()
             elseif strsub(unit, 0, 8) == "partypet" then
                 data["classes"][name] = SafeUnitName("party" .. strsub(unit, 9))
             elseif strsub(unit, 0, 7) == "raidpet" then
@@ -2441,59 +2479,71 @@ end
 
 local MAX_DAMAGE_TAKEN_HISTORY = 200
 
-local function updateDamageTaken(victimName, sourceName, spellName, damage, hitType)
-    if not victimName or type(damage) ~= "number" then return end
-    local now = GetTime()
-    for segment = 0, 1 do
-        local entry = data.damage_taken[segment]
-        if not entry[victimName] then
-            entry[victimName] = { _sum = 0, _history = {} }
-        end
-        local rec = entry[victimName]
-        rec._sum = rec._sum + damage
-
-        local existing = nil
-        for _, h in ipairs(rec._history) do
-            if h.source == sourceName and h.spell == spellName then
-                existing = h
-                break
+-- 向承受伤害历史追加/合并一条伤害记录
+--  - O(1) dedup（_historyIdx 哈希，key 用可打印分隔符 "|"，避免 \0 影响 SavedVariables）
+--  - 超出 MAX 时 table.remove(_,1) + 重排索引（O(MAX)，MAX 固定故为常数）
+local function pushDamageTakenHistory(rec, sourceName, spellName, damage, now, key)
+    rec._sum = rec._sum + damage
+    local h = rec._history
+    local idx = rec._historyIdx
+    if not idx then
+        -- 兼容旧存档：历史里没有 _historyIdx，首次使用时按现有条目重建
+        idx = {}
+        rec._historyIdx = idx
+        for pos = 1, table.getn(h) do
+            local e = h[pos]
+            if e then
+                idx[(e.source or "") .. "|" .. (e.spell or "")] = pos
             end
         end
-
+    end
+    local pos = idx[key]
+    if pos then
+        local existing = h[pos]
         if existing then
             existing.total = existing.total + damage
             existing.last = damage
             existing.time = now
-        else
-            table.insert(rec._history, {
-                source = sourceName,
-                spell = spellName,
-                total = damage,
-                last = damage,
-                time = now
-            })
-            if table.getn(rec._history) > MAX_DAMAGE_TAKEN_HISTORY then
-                table.remove(rec._history, 1)
+            return
+        end
+    end
+    local n = table.getn(h) + 1
+    h[n] = {
+        source = sourceName,
+        spell = spellName,
+        total = damage,
+        last = damage,
+        time = now,
+    }
+    idx[key] = n
+    if n > MAX_DAMAGE_TAKEN_HISTORY then
+        -- 找到指向位置 1 的 key 并移除，再整体左移
+        for k, v in pairs(idx) do
+            if v == 1 then
+                idx[k] = nil
+                break
             end
         end
+        table.remove(h, 1)
+        for k, v in pairs(idx) do
+            idx[k] = v - 1
+        end
+    end
+end
 
-        if not rec._detail_history then
-            rec._detail_history = {}
+local function updateDamageTaken(victimName, sourceName, spellName, damage, hitType)
+    if not victimName or type(damage) ~= "number" then return end
+    local now = GetTime()
+    -- "|" 不可能出现在 WoW 名称/技能名中，可作安全分隔符
+    local key = (sourceName or "") .. "|" .. (spellName or "")
+    for segment = 0, 1 do
+        local s = data.damage_taken[segment]
+        local rec = s[victimName]
+        if not rec then
+            rec = { _sum = 0, _history = {}, _historyIdx = {} }
+            s[victimName] = rec
         end
-        table.insert(rec._detail_history, {
-            source = sourceName,
-            spell = spellName,
-            damage = damage,
-            hitType = hitType,
-            time = now
-        })
-        local maxDetail = 200
-        while table.getn(rec._detail_history) > maxDetail do
-            table.remove(rec._detail_history, 1)
-        end
-        while table.getn(rec._detail_history) > 0 and rec._detail_history[1].time < now - 15 do
-            table.remove(rec._detail_history, 1)
-        end
+        pushDamageTakenHistory(rec, sourceName, spellName, damage, now, key)
     end
 end
 
@@ -2573,98 +2623,12 @@ recordHealTaken = function(targetGuid, sourceName, spellName, amount, effectiveA
             return
         end
     end
-    local now = GetTime()
-    for segment = 0, 1 do
-        local entry = data.damage_taken[segment]
-        if not entry[victimName] then
-            entry[victimName] = { _sum = 0, _history = {} }
-        end
-        local rec = entry[victimName]
-        if not rec._detail_heal_history then
-            rec._detail_heal_history = {}
-        end
-        table.insert(rec._detail_heal_history, {
-            source = sourceName,
-            spell = spellName,
-            amount = amount,
-            time = now
-        })
-        local maxHealHistory = 200
-        while table.getn(rec._detail_heal_history) > maxHealHistory do
-            table.remove(rec._detail_heal_history, 1)
-        end
-        while table.getn(rec._detail_heal_history) > 0 and rec._detail_heal_history[1].time < now - 15 do
-            table.remove(rec._detail_heal_history, 1)
-        end
-    end
     updateHealTaken(victimName, sourceName, amount, effectiveAmount)
 end
 
 -- ============================================================================
--- 25. 死亡统计与死亡回放（UNIT_DIED 事件处理）
+-- 25. 死亡统计（UNIT_DIED 事件处理）
 -- ============================================================================
-
--- 生成一次死亡回放记录：从该单位的承伤/受疗历史中取出死亡前 10 秒 ~ 死亡后 2 秒的事件，
--- 连同死亡时间与所在战斗 BOSS 名一起写入 data.death_replays（当前战）与 data.all_death_replays（跨战斗累计）
-function parser:GenerateDeathReplay(entry)
-    local name = entry.name
-    local deathTime = entry.deathTime
-    local fightBossName = entry.bossName or "未知战斗"
-
-    local victimData = data.damage_taken[1] and data.damage_taken[1][name]
-    local damageEvents = {}
-    local healEvents = {}
-
-    if victimData then
-        if victimData._detail_history then
-            for _, h in ipairs(victimData._detail_history) do
-                if h.time and h.time >= deathTime - 10 and h.time <= deathTime + 2 then
-                    table.insert(damageEvents, deepcopy(h))
-                end
-            end
-        end
-        if victimData._detail_heal_history then
-            for _, h in ipairs(victimData._detail_heal_history) do
-                if h.time and h.time >= deathTime - 10 and h.time <= deathTime + 2 then
-                    table.insert(healEvents, deepcopy(h))
-                end
-            end
-        end
-    end
-
-    if not data.death_replays[name] then
-        data.death_replays[name] = {}
-    end
-    table.insert(data.death_replays[name], {
-        deathTime = deathTime,
-        damageEvents = damageEvents,
-        healEvents = healEvents,
-        bossName = fightBossName,
-    })
-
-    if not data.all_death_replays[name] then
-        data.all_death_replays[name] = {}
-    end
-    table.insert(data.all_death_replays[name], {
-        deathTime = deathTime,
-        damageEvents = damageEvents,
-        healEvents = healEvents,
-        bossName = fightBossName,
-    })
-end
-
-function parser:ProcessDeathReplayQueue(force)
-    local now = GetTime()
-    if not self.deathReplayQueue then return end
-
-    for i = table.getn(self.deathReplayQueue), 1, -1 do
-        local entry = self.deathReplayQueue[i]
-        if force or (now - entry.queuedTime > 0.5) then
-            self:GenerateDeathReplay(entry)
-            table.remove(self.deathReplayQueue, i)
-        end
-    end
-end
 
 local function shouldTrackDeath(guid) return isUnitTracked(guid) end
 
@@ -2720,29 +2684,6 @@ local function onUnitDied(guid)
     for segment = 0, 1 do
         data.death[segment][name] = (data.death[segment][name] or 0) + 1
     end
-
-    local deathTime = GetTime()
-    if not data.death_timestamps[name] then data.death_timestamps[name] = {} end
-    table.insert(data.death_timestamps[name], deathTime)
-
-    local fightBossName = "未知战斗"
-    local maxHP = 0
-    if data.enemy_max_health then
-        for mobName, hp in pairs(data.enemy_max_health) do
-            if hp > maxHP then
-                maxHP = hp
-                fightBossName = mobName
-            end
-        end
-    end
-
-    table.insert(parser.deathReplayQueue, {
-        name = name,
-        guid = guid,
-        deathTime = deathTime,
-        bossName = fightBossName,
-        queuedTime = GetTime(),
-    })
 
     parser.lastRefreshEventTime = GetTime()
 end
@@ -3013,7 +2954,7 @@ if ShaguDPS.hasNampower then
         end
 
         if isNameIgnored(targetName) then
-            addInvalidDamage(SafeUnitName("player"), action, targetName, amount, spellSchool, 0)
+            addInvalidDamage(PlayerName(), action, targetName, amount, spellSchool, 0)
             return
         end
 
@@ -3025,7 +2966,7 @@ if ShaguDPS.hasNampower then
 
         local isFriendlyTarget = IsFriendly(targetGuid)
         if isFriendlyTarget then
-            local sourceName = SafeUnitName("player")
+            local sourceName = PlayerName()
             local targetNameF = SafeUnitName(targetGuid)
             recordFriendlyFire(GetUnitGUID("player"), sourceName, targetNameF, action, amount)
             if isUnitTracked(targetGuid) then
@@ -3037,20 +2978,20 @@ if ShaguDPS.hasNampower then
         if config.exclude_critters == 1 and IsCritter(targetGuid) then return end
 
         if not isDotTick then
-            recordHitBreakdown(SafeUnitName("player"), getSpellName(spellId), hitInfo == 2 and "crit" or "normal")
+            recordHitBreakdown(PlayerName(), getSpellName(spellId), hitInfo == 2 and "crit" or "normal")
         end
 
         local rawDamage = amount
         local overkill = CalculateOverkill(targetGuid, rawDamage)
         local finalDamage = (config.clamp_damage_to_health ~= 1) and rawDamage or (rawDamage - overkill)
         if not isFriendlyTarget then
-            recordDamageTaken(targetGuid, SafeUnitName("player"), action, amount, hitInfo == 2 and "crit" or "normal")
-            queueEnemyDamageTaken(targetGuid, SafeUnitName("player"), finalDamage, overkill)
+            recordDamageTaken(targetGuid, PlayerName(), action, amount, hitInfo == 2 and "crit" or "normal")
+            queueEnemyDamageTaken(targetGuid, PlayerName(), finalDamage, overkill)
         end
-        updateStats(SafeUnitName("player"), action, targetName, finalDamage, spellSchool, "damage", nil, nil, nil, overkill)
+        updateStats(PlayerName(), action, targetName, finalDamage, spellSchool, "damage", nil, nil, nil, overkill)
 
         if action and string.find(action, "DoT") then
-            recordDotTick(SafeUnitName("player"), action, nil)
+            recordDotTick(PlayerName(), action, nil)
         end
     end
 
@@ -3188,7 +3129,7 @@ if ShaguDPS.hasNampower then
         TrackCombatant(attackerGuid, targetGuid)
         if not parser.enabled.damage and not parser.enabled.enemy_damage_taken and not parser.enabled.invalid_damage and not parser.enabled.friendly_fire and not parser.enabled.damage_taken then return end
         local targetName = SafeUnitName(targetGuid)
-        local attackerName = SafeUnitName("player")
+        local attackerName = PlayerName()
         local extraList = parser.extraAttacks[attackerGuid]
         local extra = nil
         if extraList and table.getn(extraList) > 0 then
@@ -3212,7 +3153,7 @@ if ShaguDPS.hasNampower then
         end
 
         if isNameIgnored(targetName) then
-            addInvalidDamage(SafeUnitName("player"), action, targetName, totalDamage, 0, 0)
+            addInvalidDamage(PlayerName(), action, targetName, totalDamage, 0, 0)
             return
         end
 
@@ -3221,7 +3162,7 @@ if ShaguDPS.hasNampower then
         end
         local isFriendlyTarget = IsFriendly(targetGuid)
         if isFriendlyTarget then
-            local sourceName = SafeUnitName("player")
+            local sourceName = PlayerName()
             local targetNameF = SafeUnitName(targetGuid)
             recordFriendlyFire(GetUnitGUID("player"), sourceName, targetNameF, action, totalDamage)
             if isUnitTracked(targetGuid) then
@@ -3251,7 +3192,7 @@ if ShaguDPS.hasNampower then
         elseif bit.band(hitInfo, 16384) ~= 0 then
             swingHtype = "glancing"
         end
-        recordHitBreakdown(SafeUnitName("player"), action, swingHtype)
+        recordHitBreakdown(PlayerName(), action, swingHtype)
 
         for segment = 0, 1 do
             local entry = data.spellcast[segment]
@@ -3282,11 +3223,11 @@ if ShaguDPS.hasNampower then
         local finalDamage = (config.clamp_damage_to_health ~= 1) and rawDamage or (rawDamage - overkill)
 
         if not isFriendlyTarget then
-            recordDamageTaken(targetGuid, SafeUnitName("player"), action, totalDamage, GetSwingHitType(hitInfo, victimState, totalDamage))
-            queueEnemyDamageTaken(targetGuid, SafeUnitName("player"), finalDamage, overkill)
+            recordDamageTaken(targetGuid, PlayerName(), action, totalDamage, GetSwingHitType(hitInfo, victimState, totalDamage))
+            queueEnemyDamageTaken(targetGuid, PlayerName(), finalDamage, overkill)
         end
 
-        updateStats(SafeUnitName("player"), action, SafeUnitName(targetGuid), finalDamage, 0, "damage", nil, nil, nil, overkill)
+        updateStats(PlayerName(), action, SafeUnitName(targetGuid), finalDamage, 0, "damage", nil, nil, nil, overkill)
     end
 
     -- 自动攻击（其他）
@@ -3467,7 +3408,7 @@ if ShaguDPS.hasNampower then
     local function onSpellHealBySelf(targetGuid, casterGuid, spellId, amount, critical, periodic)
         if not parser.enabled.heal and not parser.enabled.heal_taken and not parser.enabled.spellcast then return end
         if not UnitCanAssist(targetGuid, casterGuid) then return end
-        local sourceName = SafeUnitName("player")
+        local sourceName = PlayerName()
         local targetName = SafeUnitName(targetGuid)
         local action = getSpellName(spellId)
         if periodic == 1 then action = action .. " (HoT)" end
@@ -3609,13 +3550,13 @@ if ShaguDPS.hasNampower then
         TrackCombatant(unitGuid, targetGuid)
         local targetName = SafeUnitName(targetGuid)
         if isNameIgnored(targetName) then
-            addInvalidDamage(SafeUnitName("player"), "反射", targetName, damage, spellSchool, 0)
+            addInvalidDamage(PlayerName(), "反射", targetName, damage, spellSchool, 0)
             return
         end
 
         local isFriendlyTarget = IsFriendly(targetGuid)
         if isFriendlyTarget then
-            local sourceName = SafeUnitName("player")
+            local sourceName = PlayerName()
             local targetNameF = SafeUnitName(targetGuid)
             recordFriendlyFire(GetUnitGUID("player"), sourceName, targetNameF, "反射", damage)
             if isUnitTracked(targetGuid) then
@@ -3630,11 +3571,11 @@ if ShaguDPS.hasNampower then
         local finalDamage = (config.clamp_damage_to_health ~= 1) and rawDamage or (rawDamage - overkill)
 
         if not isFriendlyTarget then
-            recordDamageTaken(targetGuid, SafeUnitName("player"), "反射", damage)
-            queueEnemyDamageTaken(targetGuid, SafeUnitName("player"), finalDamage, overkill)
+            recordDamageTaken(targetGuid, PlayerName(), "反射", damage)
+            queueEnemyDamageTaken(targetGuid, PlayerName(), finalDamage, overkill)
         end
 
-        updateStats(SafeUnitName("player"), "反射", targetName, finalDamage, spellSchool, "damage", nil, nil, nil, overkill)
+        updateStats(PlayerName(), "反射", targetName, finalDamage, spellSchool, "damage", nil, nil, nil, overkill)
     end
 
     -- 盾反伤害（其他）
@@ -3855,7 +3796,7 @@ if ShaguDPS.hasNampower then
             if not ownerGUID or not isUnitTracked(ownerGUID) then return end
         end
 
-        local casterName = SafeUnitName("player")
+        local casterName = PlayerName()
         local action = getSpellName(spellId)
         local ownerName, _ = GetOwnerInfoFromPetGUID(casterGuid)
 
@@ -4107,7 +4048,7 @@ if ShaguDPS.hasNampower then
             onSpellGo(arg1, arg2, arg3, arg4, arg5, arg6, arg7, arg8)
             if parser.enabled.dispel then
                 local spellName = getSpellName(arg2)
-                local casterName = SafeUnitName("player")
+                local casterName = PlayerName()
                 CheckWrongDispelOnSpellGo(spellName, "player", arg4, casterName)
             end
         elseif event == "SPELL_GO_OTHER" then

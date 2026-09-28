@@ -23,6 +23,9 @@ local internals = ShaguDPS.internals
 local textures = ShaguDPS.textures
 local round = ShaguDPS.round
 
+-- 窗口 OnUpdate 节流间隔（秒）：状态检查/时间戳比较的执行频率
+local WINDOW_TICK_INTERVAL = 0.2
+
 -- 格式化战斗时间，超过1分钟显示为“xx分xx.x秒”，否则显示“xx.x秒”
 local function formatDuration(seconds)
     if not seconds or seconds <= 0 then return nil end
@@ -469,8 +472,7 @@ local function deepSubtract(t1, t2)
     local result = {}
     local skipKeys = {
         ["_history"] = true,
-        ["_detail_history"] = true,
-        ["_detail_heal_history"] = true,
+        ["_historyIdx"] = true,
         ["_tick"] = true,
     }
     for k, v in pairs(t1) do
@@ -863,100 +865,6 @@ local function spairs(t, order, totalTime)
     return function() i = i + 1; if keys[i] then return keys[i], t[keys[i]] end end
 end
 
--- ============================================================================
--- 9. 获取死亡回放行（用于详情窗口）
--- ============================================================================
-
--- 死亡回放命中类型中文标签（nil/normal 不显示）
-local hitTypeLabels = {
-    crit = "|cffff5533暴击|r",
-    crushing = "|cffff8800碾压|r",
-    glancing = "|cff88ccff偏斜|r",
-    block = "|cff88ccff格挡|r",
-    dodge = "|cffaaaaaa躲闪|r",
-    parry = "|cffaaaaaa招架|r",
-    miss = "|cffaaaaaa未命中|r",
-    resist = "|cffaaaaaa抵抗|r",
-}
-
-local function GetDeathReplayLines(unitName, segType, bossFight)
-    local replayList = nil
-    if bossFight then
-        if bossFight.death_replays and bossFight.death_replays[unitName] then
-            replayList = bossFight.death_replays[unitName]
-        else
-            local currentReplays = ShaguDPS.cached_current_death_replays or data.death_replays
-            if currentReplays and currentReplays[unitName] then
-                replayList = currentReplays[unitName]
-            end
-        end
-    else
-        if data.all_death_replays and data.all_death_replays[unitName] then
-            replayList = data.all_death_replays[unitName]
-        else
-            local currentReplays = ShaguDPS.cached_current_death_replays or data.death_replays
-            if currentReplays and currentReplays[unitName] then
-                replayList = currentReplays[unitName]
-            end
-        end
-    end
-
-    if not replayList or table.getn(replayList) == 0 then
-        return nil
-    end
-
-    local defaultBossName = "未知战斗"
-    if bossFight and bossFight.name then
-        defaultBossName = bossFight.name
-    end
-
-    local lines = {}
-    for idx = table.getn(replayList), 1, -1 do
-        local replay = replayList[idx]
-        if replay then
-            local fightName = replay.bossName or defaultBossName
-            table.insert(lines, string.format("|cffffff00第%d次死亡 (战斗: %s)|r", idx, fightName))
-            local deathTime = replay.deathTime or 0
-            local events = {}
-
-            if replay.damageEvents then
-                for _, h in ipairs(replay.damageEvents) do
-                    if h.time and h.time >= deathTime - 10 and h.time <= deathTime + 2 then
-                        table.insert(events, { type = "damage", source = h.source, spell = h.spell, amount = h.damage, hitType = h.hitType, time = h.time })
-                    end
-                end
-            end
-            if replay.healEvents then
-                for _, h in ipairs(replay.healEvents) do
-                    if h.time and h.time >= deathTime - 10 and h.time <= deathTime + 2 then
-                        table.insert(events, { type = "heal", source = h.source, spell = h.spell, amount = h.amount, time = h.time })
-                    end
-                end
-            end
-
-            if table.getn(events) > 0 then
-                table.sort(events, function(a,b) return a.time > b.time end)
-                for i = 1, math.min(table.getn(events), 50) do
-                    local e = events[i]
-                    local color = e.type == "damage" and "|cffff0000" or "|cff00ff00"
-                    local prefix = e.type == "damage" and "-" or "+"
-                    local rel = deathTime - e.time
-                    if rel < 0 then rel = 0 end
-                    local hitStr = ""
-                    if e.type == "damage" and e.hitType and hitTypeLabels[e.hitType] then
-                        hitStr = " " .. hitTypeLabels[e.hitType]
-                    end
-                    table.insert(lines, string.format("  %s - %s  %s%s%s%s (死亡前%.1f秒)", e.source, e.spell, color, prefix, e.amount, hitStr, rel))
-                end
-            else
-                table.insert(lines, "  无死亡前10秒事件")
-            end
-            table.insert(lines, " ")
-        end
-    end
-    return lines
-end
-
 -- 将单位名转换为带职业颜色的显示串（返回带 |c 前缀的完整颜色串）
 local function classColorString(classToken, name)
     if classToken and classes[classToken] and RAID_CLASS_COLORS[classToken] then
@@ -967,8 +875,6 @@ local function classColorString(classToken, name)
     return name
 end
 
--- ============================================================================
--- 11. 进度条鼠标悬停显示详细数据（工具提示）
 -- ============================================================================
 -- 11. 进度条鼠标悬停显示详细数据（工具提示）
 -- ============================================================================
@@ -1191,33 +1097,6 @@ local function barTooltipShow()
         TooltipAddLine(this.title .. ":")
         TooltipAddDoubleLine("|cffffffff死亡次数", "|cffffffff" .. unitData)
         TooltipAddLine(" ")
-        local segType = config[wid] and config[wid].segment or 1
-        local bossFight = nil
-        if config[wid].view == 12 or config[wid].view == 23 then
-            if config[wid].view == 12 then
-                local fights = ShaguDPS.boss_fights
-                local idx = ShaguDPS.current_boss_index
-                if fights and idx and fights[idx] then
-                    bossFight = fights[idx]
-                elseif ShaguDPS.pendingBossRecord then
-                    bossFight = { name = ShaguDPS.pendingBossRecord.name, death_replays = data.death_replays }
-                end
-            elseif config[wid].view == 23 then
-                local fights = ShaguDPS.recent_fights
-                local idx = config[wid].recent_fight_index or ShaguDPS.current_recent_index
-                if fights and idx and fights[idx] then
-                    bossFight = fights[idx]
-                end
-            end
-        end
-        local replayLines = GetDeathReplayLines(this.unit, segType, bossFight)
-        if replayLines and table.getn(replayLines) > 0 then
-            for _, line in ipairs(replayLines) do
-                TooltipAddLine(line)
-            end
-        else
-            TooltipAddLine("|cffff8888无死亡回放记录|r")
-        end
         GameTooltip:Show()
         return
     end
@@ -1961,33 +1840,6 @@ local function GetBarDetailLines(bar)
         table.insert(lines, bar.title .. ":")
         table.insert(lines, "|cffffffff死亡次数: |cffffffff" .. unitData)
         table.insert(lines, " ")
-        local segType = config[wid] and config[wid].segment or 1
-        local bossFight = nil
-        if config[wid].view == 12 or config[wid].view == 23 then
-            if config[wid].view == 12 then
-                local fights = ShaguDPS.boss_fights
-                local idx = ShaguDPS.current_boss_index
-                if fights and idx and fights[idx] then
-                    bossFight = fights[idx]
-                elseif ShaguDPS.pendingBossRecord then
-                    bossFight = { name = ShaguDPS.pendingBossRecord.name, death_replays = data.death_replays }
-                end
-            elseif config[wid].view == 23 then
-                local fights = ShaguDPS.recent_fights
-                local idx = config[wid].recent_fight_index or ShaguDPS.current_recent_index
-                if fights and idx and fights[idx] then
-                    bossFight = fights[idx]
-                end
-            end
-        end
-        local replayLines = GetDeathReplayLines(bar.unit, segType, bossFight)
-        if replayLines and table.getn(replayLines) > 0 then
-            for _, line in ipairs(replayLines) do
-                table.insert(lines, line)
-            end
-        else
-            table.insert(lines, "|cffff8888无死亡回放记录|r")
-        end
         return lines
     end
 
@@ -2621,6 +2473,8 @@ local function ResetData()
     for k, v in pairs(data.revive[1]) do data.revive[1][k] = nil end
     for k, v in pairs(data.buff_coverage[0]) do data.buff_coverage[0][k] = nil end
     for k, v in pairs(data.buff_coverage[1]) do data.buff_coverage[1][k] = nil end
+    for k, v in pairs(data.weakness_coverage[0]) do data.weakness_coverage[0][k] = nil end
+    for k, v in pairs(data.weakness_coverage[1]) do data.weakness_coverage[1][k] = nil end
     for k, v in pairs(data.interrupt[0]) do data.interrupt[0][k] = nil end
     for k, v in pairs(data.interrupt[1]) do data.interrupt[1][k] = nil end
     for k, v in pairs(data.enemy_damage_taken[0]) do data.enemy_damage_taken[0][k] = nil end
@@ -2628,6 +2482,7 @@ local function ResetData()
     ShaguDPS.cached_current_enemy_damage_taken = nil
     ShaguDPS.cached_current_interrupt = nil
     ShaguDPS.cached_current_buff_coverage = nil
+    ShaguDPS.cached_current_weakness_coverage = nil
     ShaguDPS.buff_coverage_active = {}
     ShaguDPS.weakness_coverage_active = {}
     ShaguDPS.cached_current_damage = nil
@@ -2645,8 +2500,6 @@ local function ResetData()
     ShaguDPS.cached_current_dot_ticks = nil
     ShaguDPS.cached_current_hit_breakdown = nil
     ShaguDPS.cached_current_revive = nil
-    ShaguDPS.cached_current_death_replays = nil
-    data.death_replays = {}
 
     ShaguDPS.ClearCache()
     if ShaguDPS.Combat() then
@@ -2656,7 +2509,6 @@ local function ResetData()
     end
     data.last_fight_duration = 0
     data.total_combat_time = 0
-    data.death_timestamps = {}
     data.small_fight = {
         damage = {},
         heal = {},
@@ -3544,11 +3396,28 @@ local function ShowBossSubMenu(parent, bossModeBtn)
         btn:SetScript("OnEnter", function() this:SetBackdropBorderColor(1,.8,0,1) end)
         btn:SetScript("OnLeave", function() this:SetBackdropBorderColor(.4,.4,.4,1) end)
         btn:SetScript("OnClick", function()
+            if arg1 == "RightButton" then
+                local removed = fight.name
+                table.remove(fights, idx)
+                local n = table.getn(fights)
+                local cur = ShaguDPS.current_boss_index or idx
+                if cur > idx then cur = cur - 1 end
+                if cur < 1 then cur = 1 end
+                if n > 0 and cur > n then cur = n end
+                ShaguDPS.current_boss_index = cur
+                if ShaguDPS.InvalidateBossSummaryCache then ShaguDPS.InvalidateBossSummaryCache() end
+                menu:Hide()
+                bossModeBtn._bossMenu = nil
+                parent:Refresh(true)
+                DEFAULT_CHAT_FRAME:AddMessage("|cff00ff00[ShaguDPS] 已删除BOSS战记录: " .. (removed or "?") .. "|r")
+                return
+            end
             ShaguDPS.current_boss_index = idx
             parent:Refresh(true)
             menu:Hide()
             bossModeBtn._bossMenu = nil
         end)
+        btn:RegisterForClicks("LeftButtonUp", "RightButtonUp")
     end
 
     menu:SetScript("OnUpdate", function()
@@ -3644,6 +3513,33 @@ local function ShowRecentFightsSubMenu(parent, recentBtn)
         btn:SetScript("OnEnter", function() this:SetBackdropBorderColor(1,.8,0,1) end)
         btn:SetScript("OnLeave", function() this:SetBackdropBorderColor(.4,.4,.4,1) end)
         btn:SetScript("OnClick", function()
+            if arg1 == "RightButton" then
+                local removed = fight.name
+                table.remove(fights, idx)
+                if ShaguDPS.RenumberRecentFights then ShaguDPS.RenumberRecentFights() end
+                local n = table.getn(fights)
+                local fix = ShaguDPS.current_recent_index
+                if fix then
+                    if fix > idx then fix = fix - 1 end
+                    if fix < 1 then fix = 1 end
+                    if n > 0 and fix > n then fix = n end
+                    ShaguDPS.current_recent_index = fix
+                end
+                for w = 1, 10 do
+                    local wi = config[w] and config[w].recent_fight_index
+                    if wi then
+                        if wi > idx then wi = wi - 1 end
+                        if wi < 1 then wi = 1 end
+                        if n > 0 and wi > n then wi = n end
+                        config[w].recent_fight_index = wi
+                    end
+                end
+                menu:Hide()
+                recentBtn._bossMenu = nil
+                parent:Refresh(true)
+                DEFAULT_CHAT_FRAME:AddMessage("|cff00ff00[ShaguDPS] 已删除战斗记录: " .. (removed or "?") .. "|r")
+                return
+            end
             local wid = parent:GetID()
             if not config[wid] then config[wid] = {} end
             config[wid].recent_fight_index = idx
@@ -3656,6 +3552,7 @@ local function ShowRecentFightsSubMenu(parent, recentBtn)
             menu:Hide()
             recentBtn._bossMenu = nil
         end)
+        btn:RegisterForClicks("LeftButtonUp", "RightButtonUp")
     end
 
     menu:SetScript("OnUpdate", function()
@@ -3745,6 +3642,15 @@ reportFrame:SetScript("OnUpdate", function()
 end)
 
 startReport = function(dataTable)
+    -- /sdps export clip：整体插入聊天输入框并剥离颜色码，供手动 Ctrl+A/Ctrl+C 复制
+    if ShaguDPS._exportClip then
+        ShaguDPS._exportClip = nil
+        local text = table.concat(dataTable, "\n")
+        text = string.gsub(text, "|c%x%x%x%x%x%x%x%x", "")
+        text = string.gsub(text, "|r", "")
+        ChatFrameEditBox:Insert(text)
+        return
+    end
     reportFrame.reportQueue = dataTable
     reportFrame.reportIndex = 1
     reportFrame.reportTimer = 0
@@ -4142,158 +4048,8 @@ end
 -- 25. 刷新窗口内容（核心函数）
 -- ============================================================================
 
-local function Refresh(self, force, report)
-    if not self or type(self) == "boolean" then return end
-    self:SetScale(config.scale)
-    -- 同步本地时间戳到当前全局值，避免手动 frame:Refresh(true)（按钮点击等）
-    -- 之后 OnUpdate 因 lastRefreshTime 已最新而不再重复刷新
-    self.lastRefreshTime = parser.lastRefreshEventTime
-    local values, buttons = self.values, self.buttons
-    local wid = self:GetID()
-
-    -- 无 Nampower 时仅支持基础视图及仇恨(11)，其他强制回到伤害视图
-    if not ShaguDPS.hasNampower and (config[wid].view >= 5) and config[wid].view ~= 11 then
-        config[wid].view = 1
-    end
-
-    -- 如果当前视图被禁用，自动切换到第一个启用的视图
-    local currentView = config[wid].view
-    if currentView ~= 12 and currentView ~= 15 and not ShaguDPS.IsStatEnabled(currentView) then
-        local first = ShaguDPS.GetFirstEnabledStat()
-        if first then
-            config[wid].view = first
-            currentView = first
-        else
-            self.segment = {}
-        end
-    end
-    if currentView == 25 then
-        local first = ShaguDPS.GetFirstEnabledStat()
-        if first then
-            config[wid].view = first
-            currentView = first
-        else
-            config[wid].view = 1
-            currentView = 1
-        end
-    end
-    -- BOSS/BOSS汇总 视图内的统计类型也检查开关
-    if (currentView == 12 or currentView == 15 or currentView == 23) then
-        local bossStatToView = {
-            [1]=1, [2]=2, [3]=3, [4]=4, [5]=5, [6]=6,
-            [7]=7, [8]=8, [9]=9, [10]=10, [11]=13,
-            [12]=14, [13]=16, [14]=17, [15]=18,
-            [16]=19, [17]=20, [18]=21, [19]=22,
-            [20]=24,
-        }
-        local sv = config[wid].boss_stat_view or 1
-        -- 兼容旧配置：旧版 boss_stat_view 21 = 动作回放，现已删除，自动回退到 1
-        if sv == 21 or not bossStatToView[sv] then
-            sv = 1
-            config[wid].boss_stat_view = 1
-        end
-        if bossStatToView[sv] and not ShaguDPS.IsStatEnabled(bossStatToView[sv]) then
-            for _, id in ipairs(ShaguDPS.rightStatViews) do
-                if ShaguDPS.IsStatEnabled(id) then
-                    for k, v in pairs(bossStatToView) do
-                        if v == id then
-                            config[wid].boss_stat_view = k
-                            break
-                        end
-                    end
-                    break
-                end
-            end
-        end
-    end
-
-    local isThreatView = (config[wid].view == 11)
-    local isBossView = (config[wid].view == 12)
-    local isBossSummaryView = (config[wid].view == 15)
-    local isRecentFightView = (config[wid].view == 23)
-    local isSunderView = (config[wid].view == 13)
-    local isDamageTakenView = (config[wid].view == 14)
-    local isEnergizeView = (config[wid].view == 16) or ((isBossView or isBossSummaryView or isRecentFightView) and config[wid].boss_stat_view == 13)
-    local isInvalidDamageView = (config[wid].view == 17) or ((isBossView or isBossSummaryView or isRecentFightView) and config[wid].boss_stat_view == 14)
-    local isHealTakenView = (config[wid].view == 18) or ((isBossView or isRecentFightView) and config[wid].boss_stat_view == 15) or (isBossSummaryView and config[wid].boss_stat_view == 15)
-    local isReviveView = (config[wid].view == 19) or ((isBossView or isBossSummaryView or isRecentFightView) and config[wid].boss_stat_view == 16)
-    local isBuffCoverageView = (config[wid].view == 20) or ((isBossView or isRecentFightView) and config[wid].boss_stat_view == 17) or (isBossSummaryView and config[wid].boss_stat_view == 17)
-    local isInterruptView = (config[wid].view == 21) or ((isBossView or isBossSummaryView or isRecentFightView) and config[wid].boss_stat_view == 18)
-    local isEnemyTakenView = (config[wid].view == 22) or ((isBossView or isBossSummaryView or isRecentFightView) and config[wid].boss_stat_view == 19)
-    local isVulnCoverageView = (config[wid].view == 24) or ((isBossView or isBossSummaryView or isRecentFightView) and config[wid].boss_stat_view == 20)
-
-    self.isHealTakenView = isHealTakenView
-    self.isEnergizeView = isEnergizeView
-    self.isReviveView = isReviveView
-    self.isBuffCoverageView = isBuffCoverageView
-    self.isEnemyTakenView = isEnemyTakenView
-    self.isVulnCoverageView = isVulnCoverageView
-    self.isInterruptView = isInterruptView
-
-    local segmentType = config[wid].segment or 1
-    local isSmallFight = (segmentType == 2)
-
-    local currentBossFight = nil
-    if isBossView then
-        local fights = ShaguDPS.boss_fights
-        if fights and table.getn(fights) > 0 then
-            local idx = ShaguDPS.current_boss_index
-            if not idx or idx < 1 or idx > table.getn(fights) then
-                idx = table.getn(fights)
-                ShaguDPS.current_boss_index = idx
-            end
-            currentBossFight = fights[idx]
-        elseif ShaguDPS.pendingBossRecord then
-            currentBossFight = {
-                name = ShaguDPS.pendingBossRecord.name,
-                damage = data.damage[1],
-                heal = data.heal[1],
-                death = data.death[1],
-                spellcast = data.spellcast[1],
-                spellcast_details = data.spellcast_details[1],
-                friendly_fire = data.friendly_fire[1],
-                dispel = data.dispel[1],
-                sunder = data.sunder[1],
-                damage_taken = data.damage_taken[1],
-                enemy_damage_taken = data.enemy_damage_taken[1],
-                energize = data.energize[1],
-                invalid_damage = data.invalid_damage[1],
-                heal_taken = data.heal_taken[1],
-                dot_ticks = data.dot_ticks[1],
-                hit_breakdown = data.hit_breakdown[1],
-                revive = data.revive[1],
-                buff_coverage = data.buff_coverage[1],
-                duration = math.max(GetTime() - data.combat_start_time, 1),
-            }
-        end
-    end
-
-    local currentRecentFight = nil
-    if isRecentFightView then
-        if ShaguDPS.recent_fights and table.getn(ShaguDPS.recent_fights) > 0 then
-            local idx = config[wid].recent_fight_index or ShaguDPS.current_recent_index
-            if not idx or idx < 1 or idx > table.getn(ShaguDPS.recent_fights) then
-                idx = table.getn(ShaguDPS.recent_fights)
-                ShaguDPS.current_recent_index = idx
-            end
-            config[wid].recent_fight_index = idx
-            currentRecentFight = ShaguDPS.recent_fights[idx]
-        end
-    end
-
-    if config.visible == 1 then self:Show() else self:Hide() end
-    if ShaguDPS.config.pfuiStyle ~= 1 then
-        if config.backdrop == 1 then
-            self:SetBackdrop(backdrop_window)
-            self:SetBackdropColor(.5,.5,.5,.5)
-            self.border:SetBackdrop(backdrop_border)
-            self.border:SetBackdropBorderColor(.7,.7,.7,1)
-        else
-            self:SetBackdrop(nil)
-            self.border:SetBackdrop(nil)
-        end
-    end
-
+-- chrome 子渲染（按钮高亮/菜单/标题状态）：由 Refresh 按签名调用，输入未变时跳过
+local function RefreshChrome(self, wid, buttons, segmentType, isSmallFight, isThreatView, isBossView, isBossSummaryView, isRecentFightView, currentBossFight, currentRecentFight)
     for _, button in pairs(buttons) do button.caption:SetTextColor(1,1,1,1) end
 
     -- 更新左侧分段/视图选择按钮的标题及交互
@@ -4549,11 +4305,6 @@ local function Refresh(self, force, report)
         self:SetHeight(winHeight)
     end
 
-    for id, bar in pairs(self.bars) do
-        bar.lowerBar:Hide()
-        bar:Hide()
-    end
-
     -- 根据右侧菜单开/关状态显示/隐藏按钮
     local rightMenuShouldShow = self.rightMenuVisible == true
     if rightMenuShouldShow then
@@ -4581,6 +4332,192 @@ local function Refresh(self, force, report)
             local yOffset = (config.menu_grow_upwards == 1) and (17 + entry.idx * 14) or (-17 - entry.idx * 14)
             button:SetPoint("CENTER", self.title, "CENTER", -25.5, yOffset)
         end
+    end
+end
+
+local function Refresh(self, force, report)
+    if not self or type(self) == "boolean" then return end
+    self:SetScale(config.scale)
+    -- 同步本地时间戳到当前全局值，避免手动 frame:Refresh(true)（按钮点击等）
+    -- 之后 OnUpdate 因 lastRefreshTime 已最新而不再重复刷新
+    self.lastRefreshTime = parser.lastRefreshEventTime
+    local values, buttons = self.values, self.buttons
+    local wid = self:GetID()
+
+    -- 无 Nampower 时仅支持基础视图及仇恨(11)，其他强制回到伤害视图
+    if not ShaguDPS.hasNampower and (config[wid].view >= 5) and config[wid].view ~= 11 then
+        config[wid].view = 1
+    end
+
+    -- 如果当前视图被禁用，自动切换到第一个启用的视图
+    local currentView = config[wid].view
+    if currentView ~= 12 and currentView ~= 15 and not ShaguDPS.IsStatEnabled(currentView) then
+        local first = ShaguDPS.GetFirstEnabledStat()
+        if first then
+            config[wid].view = first
+            currentView = first
+        else
+            self.segment = {}
+        end
+    end
+    if currentView == 25 then
+        local first = ShaguDPS.GetFirstEnabledStat()
+        if first then
+            config[wid].view = first
+            currentView = first
+        else
+            config[wid].view = 1
+            currentView = 1
+        end
+    end
+    -- BOSS/BOSS汇总 视图内的统计类型也检查开关
+    if (currentView == 12 or currentView == 15 or currentView == 23) then
+        local bossStatToView = {
+            [1]=1, [2]=2, [3]=3, [4]=4, [5]=5, [6]=6,
+            [7]=7, [8]=8, [9]=9, [10]=10, [11]=13,
+            [12]=14, [13]=16, [14]=17, [15]=18,
+            [16]=19, [17]=20, [18]=21, [19]=22,
+            [20]=24,
+        }
+        local sv = config[wid].boss_stat_view or 1
+        -- 兼容旧配置：旧版 boss_stat_view 21 = 动作回放，现已删除，自动回退到 1
+        if sv == 21 or not bossStatToView[sv] then
+            sv = 1
+            config[wid].boss_stat_view = 1
+        end
+        if bossStatToView[sv] and not ShaguDPS.IsStatEnabled(bossStatToView[sv]) then
+            for _, id in ipairs(ShaguDPS.rightStatViews) do
+                if ShaguDPS.IsStatEnabled(id) then
+                    for k, v in pairs(bossStatToView) do
+                        if v == id then
+                            config[wid].boss_stat_view = k
+                            break
+                        end
+                    end
+                    break
+                end
+            end
+        end
+    end
+
+    local isThreatView = (config[wid].view == 11)
+    local isBossView = (config[wid].view == 12)
+    local isBossSummaryView = (config[wid].view == 15)
+    local isRecentFightView = (config[wid].view == 23)
+    local isSunderView = (config[wid].view == 13)
+    local isDamageTakenView = (config[wid].view == 14)
+    local isEnergizeView = (config[wid].view == 16) or ((isBossView or isBossSummaryView or isRecentFightView) and config[wid].boss_stat_view == 13)
+    local isInvalidDamageView = (config[wid].view == 17) or ((isBossView or isBossSummaryView or isRecentFightView) and config[wid].boss_stat_view == 14)
+    local isHealTakenView = (config[wid].view == 18) or ((isBossView or isRecentFightView) and config[wid].boss_stat_view == 15) or (isBossSummaryView and config[wid].boss_stat_view == 15)
+    local isReviveView = (config[wid].view == 19) or ((isBossView or isBossSummaryView or isRecentFightView) and config[wid].boss_stat_view == 16)
+    local isBuffCoverageView = (config[wid].view == 20) or ((isBossView or isRecentFightView) and config[wid].boss_stat_view == 17) or (isBossSummaryView and config[wid].boss_stat_view == 17)
+    local isInterruptView = (config[wid].view == 21) or ((isBossView or isBossSummaryView or isRecentFightView) and config[wid].boss_stat_view == 18)
+    local isEnemyTakenView = (config[wid].view == 22) or ((isBossView or isBossSummaryView or isRecentFightView) and config[wid].boss_stat_view == 19)
+    local isVulnCoverageView = (config[wid].view == 24) or ((isBossView or isBossSummaryView or isRecentFightView) and config[wid].boss_stat_view == 20)
+
+    self.isHealTakenView = isHealTakenView
+    self.isEnergizeView = isEnergizeView
+    self.isReviveView = isReviveView
+    self.isBuffCoverageView = isBuffCoverageView
+    self.isEnemyTakenView = isEnemyTakenView
+    self.isVulnCoverageView = isVulnCoverageView
+    self.isInterruptView = isInterruptView
+
+    local segmentType = config[wid].segment or 1
+    local isSmallFight = (segmentType == 2)
+
+    local currentBossFight = nil
+    if isBossView then
+        local fights = ShaguDPS.boss_fights
+        if fights and table.getn(fights) > 0 then
+            local idx = ShaguDPS.current_boss_index
+            if not idx or idx < 1 or idx > table.getn(fights) then
+                idx = table.getn(fights)
+                ShaguDPS.current_boss_index = idx
+            end
+            currentBossFight = fights[idx]
+        elseif ShaguDPS.pendingBossRecord then
+            currentBossFight = {
+                name = ShaguDPS.pendingBossRecord.name,
+                damage = data.damage[1],
+                heal = data.heal[1],
+                death = data.death[1],
+                spellcast = data.spellcast[1],
+                spellcast_details = data.spellcast_details[1],
+                friendly_fire = data.friendly_fire[1],
+                dispel = data.dispel[1],
+                sunder = data.sunder[1],
+                damage_taken = data.damage_taken[1],
+                enemy_damage_taken = data.enemy_damage_taken[1],
+                energize = data.energize[1],
+                invalid_damage = data.invalid_damage[1],
+                heal_taken = data.heal_taken[1],
+                dot_ticks = data.dot_ticks[1],
+                hit_breakdown = data.hit_breakdown[1],
+                revive = data.revive[1],
+                buff_coverage = data.buff_coverage[1],
+                duration = math.max(GetTime() - data.combat_start_time, 1),
+            }
+        end
+    end
+
+    local currentRecentFight = nil
+    if isRecentFightView then
+        if ShaguDPS.recent_fights and table.getn(ShaguDPS.recent_fights) > 0 then
+            local idx = config[wid].recent_fight_index or ShaguDPS.current_recent_index
+            if not idx or idx < 1 or idx > table.getn(ShaguDPS.recent_fights) then
+                idx = table.getn(ShaguDPS.recent_fights)
+                ShaguDPS.current_recent_index = idx
+            end
+            config[wid].recent_fight_index = idx
+            currentRecentFight = ShaguDPS.recent_fights[idx]
+        end
+    end
+
+    if config.visible == 1 then self:Show() else self:Hide() end
+    if ShaguDPS.config.pfuiStyle ~= 1 then
+        if config.backdrop == 1 then
+            self:SetBackdrop(backdrop_window)
+            self:SetBackdropColor(.5,.5,.5,.5)
+            self.border:SetBackdrop(backdrop_border)
+            self.border:SetBackdropBorderColor(.7,.7,.7,1)
+        else
+            self:SetBackdrop(nil)
+            self.border:SetBackdrop(nil)
+        end
+    end
+
+    -- chrome（按钮/菜单/标题）按签名跳过：签名未变且非 force 时复用上次渲染
+    -- 配置类变更全部经 window.Refresh(true) 强制重建；战斗列表/索引/名称由字段捕获
+    local cs = self._chromeSig
+    local bossName = currentBossFight and currentBossFight.name or false
+    local recentName = currentRecentFight and currentRecentFight.name or false
+    local nBoss = ShaguDPS.boss_fights and table.getn(ShaguDPS.boss_fights) or 0
+    local nRecent = ShaguDPS.recent_fights and table.getn(ShaguDPS.recent_fights) or 0
+    if force or not cs
+        or cs[1] ~= currentView or cs[2] ~= (config[wid].boss_stat_view or 0)
+        or cs[3] ~= segmentType or cs[4] ~= (config[wid].recent_fight_index or 0)
+        or cs[5] ~= (ShaguDPS.current_boss_index or 0) or cs[6] ~= nBoss
+        or cs[7] ~= nRecent or cs[8] ~= bossName or cs[9] ~= recentName
+        or cs[10] ~= (self.rightMenuVisible and 1 or 0)
+        or cs[11] ~= (config[wid].width or 0) or cs[12] ~= (config[wid].bars or 0)
+        or cs[13] ~= config.height or cs[14] ~= config.spacing
+        or cs[15] ~= config.menu_grow_upwards
+    then
+        RefreshChrome(self, wid, buttons, segmentType, isSmallFight, isThreatView, isBossView, isBossSummaryView, isRecentFightView, currentBossFight, currentRecentFight)
+        self._chromeSig = {
+            currentView, config[wid].boss_stat_view or 0, segmentType,
+            config[wid].recent_fight_index or 0, ShaguDPS.current_boss_index or 0,
+            nBoss, nRecent, bossName, recentName,
+            self.rightMenuVisible and 1 or 0, config[wid].width or 0, config[wid].bars or 0,
+            config.height, config.spacing, config.menu_grow_upwards,
+        }
+    end
+
+    -- 隐藏全部条目（渲染循环仅 Show 实际存在的条目）
+    for id, bar in pairs(self.bars) do
+        bar.lowerBar:Hide()
+        bar:Hide()
     end
 
     local isHealView = (config[wid].view == 3 or config[wid].view == 4 or config[wid].view == 5 or config[wid].view == 6)
@@ -4839,7 +4776,58 @@ local function Refresh(self, force, report)
         and dpsTotalTime > 0 then
         sortTotalTime = dpsTotalTime
     end
-    for name, unitdata in spairs(self.segment, sort, sortTotalTime) do
+
+    -- 排序结果缓存：segment/sort/参数不变且 key 数量一致时，
+    -- 仅用 O(n) 校验顺序即可复用；顺序未变则跳过 O(n log n) 的 table.sort。
+    -- sortTotalTime 只影响"是否走 CBT 分支"（比较时分子同除以它，顺序不变），
+    -- 故缓存键取布尔值，避免战斗中因 GetTime() 每帧变化导致缓存失效
+    local sortCBT = (sortTotalTime and sortTotalTime > 0) and true or false
+    local seg = self.segment
+    local keys
+    local needRebuild = true
+    local cachedSort = self._sortedKeys
+    if sort and cachedSort and cachedSort.seg == seg
+        and cachedSort.sort == sort and cachedSort.cbt == sortCBT then
+        local ckeys = cachedSort.keys
+        local n = table.getn(ckeys)
+        local count = 0
+        for _ in pairs(seg) do count = count + 1 end
+        if count == n then
+            local valid = true
+            for j = 1, n do
+                if seg[ckeys[j]] == nil then
+                    valid = false
+                    break
+                end
+            end
+            if valid then
+                for j = 1, n - 1 do
+                    if sort(seg, ckeys[j + 1], ckeys[j], sortTotalTime) then
+                        valid = false
+                        break
+                    end
+                end
+            end
+            if valid then
+                keys = ckeys
+                needRebuild = false
+            end
+        end
+    end
+    if needRebuild then
+        keys = {}
+        for k in pairs(seg) do keys[table.getn(keys) + 1] = k end
+        if sort then
+            table.sort(keys, function(a, b) return sort(seg, a, b, sortTotalTime) end)
+        else
+            table.sort(keys)
+        end
+        self._sortedKeys = { seg = seg, keys = keys, sort = sort, cbt = sortCBT }
+    end
+
+    for idx = 1, table.getn(keys) do
+        local name = keys[idx]
+        local unitdata = seg[name]
         self.values.name = name
         local totalTimeOverride = nil
         if isBuffCoverageView or isVulnCoverageView then
@@ -4872,59 +4860,97 @@ local function Refresh(self, force, report)
         local bar = i - self.scroll
         if bar >= 1 and bar <= (config[wid].bars or 8) then
             self.bars[bar] = not force and self.bars[bar] or CreateBar(self, bar)
+            if force then self.bars[bar]._bcache = nil end
+            -- 视图/BOSS统计类型变化时模板随之变化（含 Refresh 内自动纠正视图的路径），
+            -- 此时 force 可能为 false，需按视图标识显式失效缓存
+            local curView = config[wid].view
+            local curBossStat = config[wid].boss_stat_view or 1
+            local bc = self.bars[bar]._bcache
+            if bc and (bc.v ~= curView or bc.bs ~= curBossStat) then
+                bc = nil
+            end
+            if not bc then
+                bc = { v = curView, bs = curBossStat }
+                self.bars[bar]._bcache = bc
+            end
             self.bars[bar].title = self.values.name
             self.bars[bar].unit = name
 
             -- 设置职业图标：有职业则显示对应图标，否则隐藏贴图（保留文字对齐）
             if self.bars[bar].classIcon then
                 local classToken = resolveClassToken(name)
-                if classToken and classIcons[classToken] and config.show_class_icon ~= 0 then
-                    self.bars[bar].classIcon:SetTexture(classIconTexture)
-                    self.bars[bar].classIcon:SetTexCoord(unpack(classIcons[classToken]))
-                    self.bars[bar].classIcon:Show()
-                    if self.bars[bar].iconBg then self.bars[bar].iconBg:Show() end
-                else
-                    self.bars[bar].classIcon:SetTexture(nil)
-                    self.bars[bar].classIcon:Hide()
-                    if self.bars[bar].iconBg then self.bars[bar].iconBg:Hide() end
+                local iconToken = (classToken and classIcons[classToken] and config.show_class_icon ~= 0) and classToken or false
+                if bc.icon ~= iconToken then
+                    if iconToken then
+                        self.bars[bar].classIcon:SetTexture(classIconTexture)
+                        self.bars[bar].classIcon:SetTexCoord(unpack(classIcons[iconToken]))
+                        self.bars[bar].classIcon:Show()
+                        if self.bars[bar].iconBg then self.bars[bar].iconBg:Show() end
+                    else
+                        self.bars[bar].classIcon:SetTexture(nil)
+                        self.bars[bar].classIcon:Hide()
+                        if self.bars[bar].iconBg then self.bars[bar].iconBg:Hide() end
+                    end
+                    bc.icon = iconToken
                 end
             end
 
+            local newMax, newVal
             if isThreatView then
                 local maxPerc = self.values.perc_best or 100
                 if maxPerc < 100 then maxPerc = 100 end
-                self.bars[bar]:SetMinMaxValues(0, maxPerc)
-                self.bars[bar]:SetValue(self.values.perc)
+                newMax = maxPerc
+                newVal = self.values.perc
             elseif isDamageTakenView then
-                self.bars[bar]:SetMinMaxValues(0, self.values.damage_taken_best > 0 and self.values.damage_taken_best or 1)
+                newMax = self.values.damage_taken_best > 0 and self.values.damage_taken_best or 1
+                newVal = self.values.damage_taken_value
             elseif isHealTakenView then
-                self.bars[bar]:SetMinMaxValues(0, self.values.best > 0 and self.values.best or 1)
+                newMax = self.values.best > 0 and self.values.best or 1
+                newVal = self.values[template.bar_val]
             elseif isReviveView then
-                self.bars[bar]:SetMinMaxValues(0, self.values.revive_best > 0 and self.values.revive_best or 1)
+                newMax = self.values.revive_best > 0 and self.values.revive_best or 1
+                newVal = self.values[template.bar_val]
             else
                 local barMax = self.values[template.bar_max]
                 if type(barMax) ~= "number" or barMax <= 0 then barMax = 1 end
-                self.bars[bar]:SetMinMaxValues(0, barMax)
+                newMax = barMax
+                newVal = self.values[template.bar_val]
             end
-            if not isThreatView then
-                if not isDamageTakenView then
-                    self.bars[bar]:SetValue(self.values[template.bar_val])
-                else
-                    self.bars[bar]:SetValue(self.values.damage_taken_value)
-                end
+            if bc.max ~= newMax then
+                self.bars[bar]:SetMinMaxValues(0, newMax)
+                bc.max = newMax
+            end
+            if bc.val ~= newVal then
+                self.bars[bar]:SetValue(newVal)
+                bc.val = newVal
             end
             if template.bar_lower_max and template.bar_lower_val then
-                self.bars[bar].lowerBar:SetMinMaxValues(0, self.values[template.bar_lower_max])
-                self.bars[bar].lowerBar:SetValue(self.values[template.bar_lower_val])
+                local lmax = self.values[template.bar_lower_max]
+                local lval = self.values[template.bar_lower_val]
+                if bc.lmax ~= lmax or bc.lval ~= lval then
+                    self.bars[bar].lowerBar:SetMinMaxValues(0, lmax)
+                    self.bars[bar].lowerBar:SetValue(lval)
+                    bc.lmax, bc.lval = lmax, lval
+                end
                 self.bars[bar].lowerBar:Show()
             else
                 self.bars[bar].lowerBar:Hide()
             end
-            self.bars[bar]:SetStatusBarColor(self.values.color.r, self.values.color.g, self.values.color.b)
-            if self.bars[bar].lowerBar:IsShown() then
-                self.bars[bar].lowerBar:SetStatusBarColor(self.values.color.r, self.values.color.g, self.values.color.b, 0.7)
+            local cr, cg, cb = self.values.color.r, self.values.color.g, self.values.color.b
+            if bc.cr ~= cr or bc.cg ~= cg or bc.cb ~= cb then
+                self.bars[bar]:SetStatusBarColor(cr, cg, cb)
+                bc.cr, bc.cg, bc.cb = cr, cg, cb
             end
-            self.bars[bar].textLeft:SetText(i .. ". " .. self.values.name)
+            if self.bars[bar].lowerBar:IsShown() then
+                if bc.lcr ~= cr or bc.lcg ~= cg or bc.lcb ~= cb then
+                    self.bars[bar].lowerBar:SetStatusBarColor(cr, cg, cb, 0.7)
+                    bc.lcr, bc.lcg, bc.lcb = cr, cg, cb
+                end
+            end
+            if bc.li ~= i or bc.ln ~= self.values.name then
+                self.bars[bar].textLeft:SetText(i .. ". " .. self.values.name)
+                bc.li, bc.ln = i, self.values.name
+            end
 
             local a = template.bar_string_params
             local bar_string = template.bar_string
@@ -5011,28 +5037,50 @@ local function Refresh(self, force, report)
                 bar_params = { "total_count", "avg_cov" }
             end
 
-            local params = {}
-            for _, param in ipairs(bar_params) do
-                local val = self.values[param]
-                if type(val) == "number" and (
-                    param == "value" or
-                    param == "value_persecond" or
-                    param == "effective_value" or
-                    param == "effective_value_persecond" or
-                    param == "uneffective_value" or
-                    param == "uneffective_value_persecond" or
-                    param == "threat_value" or
-                    param == "enemy_taken_value" or
-                    param == "enemy_taken_overkill" or
-                    param == "damage_taken_value" or
-                    param == "overkill"
-                ) then
-                    val = formatBarNumber(val)
+            -- 右侧文本：先比较输入（bar_string + 各参数值），未变则跳过
+            -- params 表构建 / formatBarNumber / string.format / SetText
+            local nParams = table.getn(bar_params)
+            local needRight = (bc.rbs ~= bar_string) or (bc.rpn ~= nParams)
+            if not needRight then
+                for pi = 1, nParams do
+                    if bc["rpv" .. pi] ~= self.values[bar_params[pi]] then
+                        needRight = true
+                        break
+                    end
                 end
-                table.insert(params, val)
             end
-            local line = string.format(bar_string, unpack(params))
-            self.bars[bar].textRight:SetText(line)
+            if needRight then
+                local params = {}
+                for _, param in ipairs(bar_params) do
+                    local val = self.values[param]
+                    if type(val) == "number" and (
+                        param == "value" or
+                        param == "value_persecond" or
+                        param == "effective_value" or
+                        param == "effective_value_persecond" or
+                        param == "uneffective_value" or
+                        param == "uneffective_value_persecond" or
+                        param == "threat_value" or
+                        param == "enemy_taken_value" or
+                        param == "enemy_taken_overkill" or
+                        param == "damage_taken_value" or
+                        param == "overkill"
+                    ) then
+                        val = formatBarNumber(val)
+                    end
+                    table.insert(params, val)
+                end
+                local line = string.format(bar_string, unpack(params))
+                if bc.rline ~= line then
+                    self.bars[bar].textRight:SetText(line)
+                end
+                bc.rline = line
+                bc.rbs = bar_string
+                bc.rpn = nParams
+                for pi = 1, nParams do
+                    bc["rpv" .. pi] = self.values[bar_params[pi]]
+                end
+            end
 
             self.bars[bar]:Show()
             if report and i <= config.report_lines then
@@ -5169,7 +5217,7 @@ local function CreateWindow(wid)
     frame:SetScript("OnUpdate", function()
         if this.sizing then this:Resize() end
         local now = GetTime()
-        if ( this.tick or 1) > now then return else this.tick = now + .2 end
+        if ( this.tick or 1) > now then return else this.tick = now + WINDOW_TICK_INTERVAL end
         if config.lock == 0 and MouseIsOver(this) then
             this.btnResize:SetAlpha(.5)
         else

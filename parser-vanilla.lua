@@ -356,8 +356,10 @@ end
 local defaults = {}
 
 -- 预先转换"吸收/抵抗"后缀模式，供事件处理器剥离战斗日志里的后缀文字
-local absorb = sanitize(ABSORB_TRAILER)
-local resist = sanitize(RESIST_TRAILER)
+-- ABSORB_TRAILER/RESIST_TRAILER 来自客户端 GlobalStrings（如 " (%d absorbed)"）；
+-- 极端环境下缺失时置 nil，跳过后缀剥离而非在加载期崩溃
+local absorb = ABSORB_TRAILER and sanitize(ABSORB_TRAILER)
+local resist = RESIST_TRAILER and sanitize(RESIST_TRAILER)
 
 -- cfind 返回值缓存与缺省常量
 local _, num, pattern, result, a1, a2, a3, a4, a5
@@ -375,8 +377,13 @@ parser:SetScript("OnEvent", function()
     if not player then player = UnitName("player") end
 
     -- 移除吸收和抵抗后缀，避免干扰伤害数值的捕获
-    arg1 = string.gsub(arg1, absorb, empty)
-    arg1 = string.gsub(arg1, resist, empty)
+    -- 先 find 后 gsub：绝大多数行无后缀，避免 Lua 5.0 gsub 无匹配时也分配新串
+    if absorb and string.find(arg1, absorb) then
+        arg1 = string.gsub(arg1, absorb, empty)
+    end
+    if resist and string.find(arg1, resist) then
+        arg1 = string.gsub(arg1, resist, empty)
+    end
 
     -- 设置默认值：施法者为玩家自己，目标为玩家自己，学派为物理，攻击类型为自动攻击
     defaults.source = player

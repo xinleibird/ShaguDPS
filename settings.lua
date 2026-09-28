@@ -606,6 +606,8 @@ SlashCmdList["SHAGUMETER"] = function(msg, editbox)
         p("  /sdps toggle |cffcccccc- 切换窗口显示")
         p("  /sdps cache reset |cffcccccc- 清除战斗日志缓存")
         p("  /sdps autoreset " .. config.auto_reset_on_new_group .. " |cffcccccc- 加入新队伍时是否询问清空（0=否，1=是）")
+        p("  /sdps export clip |cffcccccc- 当前视图数据插入聊天输入框（可 Ctrl+A/Ctrl+C 复制）")
+        p("  /sdps throttle " .. config.onupdate_interval .. " |cffcccccc- 刷新节流间隔秒数（0.05-2，越小越灵敏）")
         return
     end
 
@@ -615,134 +617,103 @@ SlashCmdList["SHAGUMETER"] = function(msg, editbox)
     args = args or ""
 
     -- 各子命令均遵循"设置配置 → 保存 → 刷新窗口 → 反馈结果"的流程
+    -- 表驱动：flagCmds 为 0/1 开关类，numberCmds 为数值类；toggle/texture/cache 特殊处理
+    local OK = "|cffffcc00Shagu|cffffffffDPS:|cffffddcc "
+    local ERR = "|cffffcc00Shagu|cffffffffDPS:|cffff5511 "
+    local c = strlower(cmd)
 
-    if strlower(cmd) == "visible" then
-        if tonumber(args) and (tonumber(args) == 1 or tonumber(args) == 0) then
-            config.visible = tonumber(args)
+    local flagCmds = {
+        visible   = { key = "visible",                 label = "Visible",              refresh = true },
+        lock      = { key = "lock",                    label = "Lock",                 refresh = true },
+        trackall  = { key = "track_all_units",         label = "Track all units",      refresh = true },
+        mergepet  = { key = "merge_pets",              label = "Merge pet",            refresh = true },
+        pastel    = { key = "pastel",                  label = "Use pastel colors",    refresh = true },
+        icon      = { key = "show_class_icon",         label = "Show class icons",     refresh = true },
+        titlehide = { key = "title_autohide",          label = "Title bar autohide",   refresh = true },
+        backdrop  = { key = "backdrop",                label = "Show window backdrop", refresh = true },
+        cunits    = { key = "chinese_units",           label = "中文单位",             refresh = true },
+        autoreset = { key = "auto_reset_on_new_group", label = "新队伍清空询问",       refresh = false },
+    }
+    local def = flagCmds[c]
+    if def then
+        local v = tonumber(args)
+        if v and (v == 1 or v == 0) then
+            config[def.key] = v
             SaveConfig()
-            window.Refresh(true)
-            p("|cffffcc00Shagu|cffffffffDPS:|cffffddcc Visible: " .. config.visible)
+            if def.refresh then window.Refresh(true) end
+            p(OK .. def.label .. ": " .. config[def.key])
         else
-            p("|cffffcc00Shagu|cffffffffDPS:|cffff5511 Valid Options are 0-1")
+            p(ERR .. "Valid Options are 0-1")
         end
-    elseif strlower(cmd) == "lock" then
-        if tonumber(args) and (tonumber(args) == 1 or tonumber(args) == 0) then
-            config.lock = tonumber(args)
+        return
+    end
+
+    local numberCmds = {
+        height  = { key = "height",  label = "Bar height",  err = "Valid Options are 1-999", refresh = true },
+        spacing = { key = "spacing", label = "Bar spacing", err = "Valid Options are 0-" .. config.height, refresh = true },
+    }
+    def = numberCmds[c]
+    if def then
+        local v = tonumber(args)
+        if v then
+            config[def.key] = v
             SaveConfig()
-            window.Refresh(true)
-            p("|cffffcc00Shagu|cffffffffDPS:|cffffddcc Lock: " .. config.lock)
+            if def.refresh then window.Refresh(true) end
+            p(OK .. def.label .. ": " .. config[def.key])
         else
-            p("|cffffcc00Shagu|cffffffffDPS:|cffff5511 Valid Options are 0-1")
+            p(ERR .. def.err)
         end
-    elseif strlower(cmd) == "toggle" then
+        return
+    end
+
+    if c == "toggle" then
         config.visible = config.visible == 1 and 0 or 1
         SaveConfig()
         window.Refresh(true)
-        p("|cffffcc00Shagu|cffffffffDPS:|cffffddcc Visible: " .. config.visible)
-    elseif strlower(cmd) == "height" then
-        if tonumber(args) then
-            config.height = tonumber(args)
+        p(OK .. "Visible: " .. config.visible)
+    elseif c == "texture" then
+        local v = tonumber(args)
+        if v and textures[v] then
+            config.texture = v
             SaveConfig()
             window.Refresh(true)
-            p("|cffffcc00Shagu|cffffffffDPS:|cffffddcc Bar height: " .. config.height)
+            p(OK .. "Texture: " .. config.texture)
         else
-            p("|cffffcc00Shagu|cffffffffDPS:|cffff5511 Valid Options are 1-999")
+            p(ERR .. "Valid Options are 1-" .. table.getn(textures))
         end
-    elseif strlower(cmd) == "spacing" then
-        if tonumber(args) then
-            config.spacing = tonumber(args)
-            SaveConfig()
-            window.Refresh(true)
-            p("|cffffcc00Shagu|cffffffffDPS:|cffffddcc Bar spacing: " .. config.spacing)
-        else
-            p("|cffffcc00Shagu|cffffffffDPS:|cffff5511 Valid Options are 0-" .. config.height)
-        end
-    elseif strlower(cmd) == "trackall" then
-        if tonumber(args) and (tonumber(args) == 1 or tonumber(args) == 0) then
-            config.track_all_units = tonumber(args)
-            SaveConfig()
-            window.Refresh(true)
-            p("|cffffcc00Shagu|cffffffffDPS:|cffffddcc Track all units: " .. config.track_all_units)
-        else
-            p("|cffffcc00Shagu|cffffffffDPS:|cffff5511 Valid Options are 0-1")
-        end
-    elseif strlower(cmd) == "mergepet" then
-        if tonumber(args) and (tonumber(args) == 1 or tonumber(args) == 0) then
-            config.merge_pets = tonumber(args)
-            SaveConfig()
-            window.Refresh(true)
-            p("|cffffcc00Shagu|cffffffffDPS:|cffffddcc Merge pet: " .. config.merge_pets)
-        else
-            p("|cffffcc00Shagu|cffffffffDPS:|cffff5511 Valid Options are 0-1")
-        end
-    elseif strlower(cmd) == "texture" then
-        if tonumber(args) and textures[tonumber(args)] then
-            config.texture = tonumber(args)
-            SaveConfig()
-            window.Refresh(true)
-            p("|cffffcc00Shagu|cffffffffDPS:|cffffddcc Texture: " .. config.texture)
-        else
-            p("|cffffcc00Shagu|cffffffffDPS:|cffff5511 Valid Options are 1-" .. table.getn(textures))
-        end
-    elseif strlower(cmd) == "pastel" then
-        if tonumber(args) and (tonumber(args) == 1 or tonumber(args) == 0) then
-            config.pastel = tonumber(args)
-            SaveConfig()
-            window.Refresh(true)
-            p("|cffffcc00Shagu|cffffffffDPS:|cffffddcc Use pastel colors: " .. config.pastel)
-        else
-            p("|cffffcc00Shagu|cffffffffDPS:|cffff5511 Valid Options are 0-1")
-        end
-    elseif strlower(cmd) == "icon" then
-        if tonumber(args) and (tonumber(args) == 1 or tonumber(args) == 0) then
-            config.show_class_icon = tonumber(args)
-            SaveConfig()
-            window.Refresh(true)
-            p("|cffffcc00Shagu|cffffffffDPS:|cffffddcc Show class icons: " .. config.show_class_icon)
-        else
-            p("|cffffcc00Shagu|cffffffffDPS:|cffff5511 Valid Options are 0-1")
-        end
-    elseif strlower(cmd) == "titlehide" then
-        if tonumber(args) and (tonumber(args) == 1 or tonumber(args) == 0) then
-            config.title_autohide = tonumber(args)
-            SaveConfig()
-            window.Refresh(true)
-            p("|cffffcc00Shagu|cffffffffDPS:|cffffddcc Title bar autohide: " .. config.title_autohide)
-        else
-            p("|cffffcc00Shagu|cffffffffDPS:|cffff5511 Valid Options are 0-1")
-        end
-    elseif strlower(cmd) == "backdrop" then
-        if tonumber(args) and (tonumber(args) == 1 or tonumber(args) == 0) then
-            config.backdrop = tonumber(args)
-            SaveConfig()
-            window.Refresh(true)
-            p("|cffffcc00Shagu|cffffffffDPS:|cffffddcc Show window backdrop: " .. config.backdrop)
-        else
-            p("|cffffcc00Shagu|cffffffffDPS:|cffff5511 Valid Options are 0-1")
-        end
-    elseif strlower(cmd) == "cache" then
+    elseif c == "cache" then
         if strlower(args) == "reset" then
             ShaguDPS.ClearCache()
-            p("|cffffcc00Shagu|cffffffffDPS:|cffffddcc 缓存已清除。")
+            p(OK .. "缓存已清除。")
         else
-            p("|cffffcc00Shagu|cffffffffDPS:|cffffddcc 用法: /sdps cache reset")
+            p(OK .. "用法: /sdps cache reset")
         end
-    elseif strlower(cmd) == "autoreset" then
-        if tonumber(args) and (tonumber(args) == 1 or tonumber(args) == 0) then
-            config.auto_reset_on_new_group = tonumber(args)
-            SaveConfig()
-            p("|cffffcc00Shagu|cffffffffDPS:|cffffddcc 新队伍清空询问: " .. config.auto_reset_on_new_group)
+    elseif c == "export" then
+        if strlower(args) == "clip" then
+            local frame = window[1]
+            if frame then
+                ShaguDPS._exportClip = true
+                frame:Refresh(nil, true)
+                if ShaguDPS._exportClip then
+                    ShaguDPS._exportClip = nil
+                    p(ERR .. "导出失败：当前视图无数据")
+                else
+                    p(OK .. "已插入聊天输入框（可 Ctrl+A/Ctrl+C 复制）")
+                end
+            else
+                p(ERR .. "窗口尚未创建")
+            end
         else
-            p("|cffffcc00Shagu|cffffffffDPS:|cffff5511 Valid Options are 0-1")
+            p(OK .. "用法: /sdps export clip")
         end
-    elseif strlower(cmd) == "cunits" then
-        if tonumber(args) and (tonumber(args) == 1 or tonumber(args) == 0) then
-            config.chinese_units = tonumber(args)
+    elseif c == "throttle" then
+        local v = tonumber(args)
+        if v and v >= 0.05 and v <= 2 then
+            config.onupdate_interval = v
             SaveConfig()
-            window.Refresh(true)
-            p("|cffffcc00Shagu|cffffffffDPS:|cffffddcc 中文单位: " .. config.chinese_units)
+            p(OK .. "刷新节流间隔: " .. v .. "s（下一帧生效）")
         else
-            p("|cffffcc00Shagu|cffffffffDPS:|cffff5511 Valid Options are 0-1")
+            p(ERR .. "Valid Options are 0.05-2")
         end
     end
 end

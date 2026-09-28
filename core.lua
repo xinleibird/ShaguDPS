@@ -171,9 +171,6 @@ local data = {
     classes = {},
     threat = {},
     threat_history = {},
-    death_timestamps = {},
-    death_replays = {},
-    all_death_replays = {},
 }
 
 data.combat_start_time = 0
@@ -234,6 +231,7 @@ local config = {
     report_lines = 10,
     pfuiStyle = 0,
     auto_reset_on_new_group = 1,
+    onupdate_interval = 0.1,
     separate_mh_oh_damage = 0,
     use_total_cbt_for_dps = 0,
     show_class_icon = 0,
@@ -264,12 +262,10 @@ local internals = {
     ["_overkill"] = true,
     ["_overkill_by_spell"] = true,
     ["_history"] = true,
+    ["_historyIdx"] = true,
     ["_by_type"] = true,
     ["_by_target"] = true,
     ["_total_time"] = true,
-    ["_events"] = true,
-    ["_deaths"] = true,
-    ["_target_deaths"] = true,
 }
 
 -- 创建核心组件框架（实际内容在其他文件中填充）
@@ -440,7 +436,6 @@ ShaguDPS.cached_current_spellcast_details = nil
 ShaguDPS.cached_current_hit_breakdown = nil
 ShaguDPS.cached_current_buff_coverage = nil
 ShaguDPS.cached_current_weakness_coverage = nil
-ShaguDPS.cached_current_death_replays = nil
 
 -- 附近非队伍玩家职业映射（用于职业图标，不参与染色）
 ShaguDPS.classIcons = ShaguDPS.classIcons or {}
@@ -521,13 +516,10 @@ function ShaguDPS.SaveDataToCache()
     ShaguDPS_Cache.buff_coverage1 = data.buff_coverage[1]
     ShaguDPS_Cache.weakness_coverage1 = data.weakness_coverage[1]
     ShaguDPS_Cache.interrupt1 = data.interrupt[1]
-    ShaguDPS_Cache.cached_current_death_replays = ShaguDPS.cached_current_death_replays
-    ShaguDPS_Cache.all_death_replays = data.all_death_replays
     ShaguDPS_Cache.classes = data.classes
     ShaguDPS_Cache.boss_fights = ShaguDPS.boss_fights
     ShaguDPS_Cache.recent_fights = ShaguDPS.recent_fights
     ShaguDPS_Cache.current_recent_index = ShaguDPS.current_recent_index
-    ShaguDPS_Cache.death_timestamps = data.death_timestamps
     ShaguDPS_Cache.total_combat_time = data.total_combat_time
     ShaguDPS_Cache.revive_noncombat = data.revive_noncombat
     ShaguDPS_Cache.combat_start_time = data.combat_start_time
@@ -645,17 +637,10 @@ function ShaguDPS.LoadDataFromCache()
         ShaguDPS.cached_current_interrupt = ShaguDPS_Cache.interrupt1
         data.interrupt[1] = {}
     end
-    if ShaguDPS_Cache.cached_current_death_replays then
-        ShaguDPS.cached_current_death_replays = ShaguDPS_Cache.cached_current_death_replays
-    end
-    if ShaguDPS_Cache.all_death_replays then
-        data.all_death_replays = ShaguDPS_Cache.all_death_replays
-    end
     if ShaguDPS_Cache.classes then data.classes = ShaguDPS_Cache.classes end
     if ShaguDPS_Cache.boss_fights then ShaguDPS.boss_fights = ShaguDPS_Cache.boss_fights end
     if ShaguDPS_Cache.recent_fights then ShaguDPS.recent_fights = ShaguDPS_Cache.recent_fights end
     if ShaguDPS_Cache.current_recent_index then ShaguDPS.current_recent_index = ShaguDPS_Cache.current_recent_index end
-    if ShaguDPS_Cache.death_timestamps then data.death_timestamps = ShaguDPS_Cache.death_timestamps end
     if ShaguDPS_Cache.total_combat_time then data.total_combat_time = ShaguDPS_Cache.total_combat_time end
     if ShaguDPS_Cache.revive_noncombat then data.revive_noncombat = ShaguDPS_Cache.revive_noncombat end
     if ShaguDPS_Cache.combat_start_time then data.combat_start_time = ShaguDPS_Cache.combat_start_time end
@@ -729,9 +714,6 @@ function ShaguDPS.ClearCache()
     ShaguDPS.cached_current_buff_coverage = nil
     ShaguDPS.cached_current_weakness_coverage = nil
     ShaguDPS.cached_current_interrupt = nil
-    ShaguDPS.cached_current_death_replays = nil
-    data.death_replays = {}
-    data.all_death_replays = {}
     ShaguDPS.boss_fights = {}
     ShaguDPS.recent_fights = {}
     ShaguDPS.current_recent_index = nil
@@ -751,7 +733,6 @@ function ShaguDPS.ClearCache()
     data.dot_ticks[1] = {}
     data.hit_breakdown[0] = {}
     data.hit_breakdown[1] = {}
-    data.death_timestamps = {}
     data.total_combat_time = 0
     data.combat_start_time = 0
     data.last_fight_duration = 0
