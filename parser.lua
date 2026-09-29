@@ -113,11 +113,34 @@ local healthCache = {}
 -- 2. 安全工具函数
 -- ============================================================================
 
+-- 死亡/消失 GUID 的 UnitName 恒返回 nil，pendingEvents 重试期间会反复查询；
+-- 0.5s TTL 缓存让每个 GUID 每半秒至多查询一次（nil 结果也缓存）
+local SAFE_UNIT_NAME_TTL = 0.5
+local SAFE_UNIT_NAME_PRUNE_INTERVAL = 10
+local SAFE_UNIT_NAME_MAX_AGE = 30
+local safeUnitNameCache = {}
+local safeUnitNameTime = {}
+local safeUnitNamePruneNext = 0
+
 local function SafeUnitName(guid)
     if not guid or guid == "" or guid == "0x0000000000000000" then
         return nil
     end
-    return UnitName(guid)
+    -- 仅缓存 GUID（0x 开头）；unit token（player/target 等）指向可变，不缓存
+    if strsub(guid, 1, 2) ~= "0x" then
+        return UnitName(guid)
+    end
+    local now = GetTime()
+    local cachedAt = safeUnitNameTime[guid]
+    if cachedAt and now - cachedAt < SAFE_UNIT_NAME_TTL then
+        local cached = safeUnitNameCache[guid]
+        if cached then return cached end
+        return nil
+    end
+    local name = UnitName(guid)
+    safeUnitNameCache[guid] = name or false
+    safeUnitNameTime[guid] = now
+    return name
 end
 
 -- 玩家名会话内不变，缓存避免事件热路径重复调用 UnitName（首个单位就绪前返回 nil 并重试）
@@ -166,32 +189,39 @@ end
 local function processPendingEvents()
     local now = GetTime()
     local anyRemaining = false
-    local processed = true
-    while processed do
-        processed = false
-        for id, event in pairs(parser.pendingEvents) do
-            if now - event.createTime > 3 then
+    local ready = nil
+    -- 单遍扫描：收集就绪事件，避免外层 while 多轮全表重扫
+    for id, event in pairs(parser.pendingEvents) do
+        if now - event.createTime > 3 then
+            parser.pendingEvents[id] = nil
+        else
+            local allReady = true
+            for _, guid in ipairs(event.guids) do
+                if isUnknownName(SafeUnitName(guid)) then
+                    allReady = false
+                    break
+                end
+            end
+            if allReady then
                 parser.pendingEvents[id] = nil
-                processed = true
+                if not ready then ready = {} end
+                table.insert(ready, event)
             else
-                local allReady = true
-                for _, guid in ipairs(event.guids) do
-                    if isUnknownName(SafeUnitName(guid)) then
-                        allReady = false
-                        break
-                    end
-                end
-                if allReady then
-                    event.func(unpack(event.args))
-                    parser.pendingEvents[id] = nil
-                    processed = true
-                else
-                    anyRemaining = true
-                end
+                anyRemaining = true
             end
         end
     end
+    -- 遍历之外执行：func 内可能 ScheduleEvent 入队新事件，避免 pairs 遍历中插入新键
+    if ready then
+        for i = 1, table.getn(ready) do
+            local event = ready[i]
+            event.func(unpack(event.args))
+        end
+    end
     if anyRemaining then
+        parser.nextProcessTime = now + PENDING_EVENT_DELAY
+    elseif next(parser.pendingEvents) ~= nil then
+        -- 执行阶段 ScheduleEvent 新入队的事件（其设置可能被下方清零逻辑覆盖），保留下一轮调度
         parser.nextProcessTime = now + PENDING_EVENT_DELAY
     else
         parser.nextProcessTime = 0
@@ -218,6 +248,16 @@ parser:SetScript("OnUpdate", function()
                     ShaguDPS.activeBadDispelDebuffs[guid] = nil
                 end
                 parser.badDispelClearTimes[guid] = nil
+            end
+        end
+    end
+    -- 定期清理过期的 SafeUnitName 缓存，防止长时间会话中 GUID 表无界增长
+    if now >= safeUnitNamePruneNext then
+        safeUnitNamePruneNext = now + SAFE_UNIT_NAME_PRUNE_INTERVAL
+        for g, t in pairs(safeUnitNameTime) do
+            if now - t > SAFE_UNIT_NAME_MAX_AGE then
+                safeUnitNameTime[g] = nil
+                safeUnitNameCache[g] = nil
             end
         end
     end
@@ -2646,12 +2686,29 @@ local function onUnitDied(guid)
         parser:HandleWeaknessTargetDeath(guid, name, GetTime())
     end
 
+    if parser.processPendingEvents then
+        -- 先消化名称仍可解析的事件（尸体尚在）
+        parser.processPendingEvents()
+        -- 死亡 GUID 名称已不可解析的事件永远无法就绪，
+        -- 立即移除，避免 3 秒超时窗内每次节流都反复重试
+        -- 与 stat7 无关，需无条件执行（多怪同死时无论是否启用死亡统计都卡）
+        for id, event in pairs(parser.pendingEvents) do
+            local eventGuids = event.guids
+            if eventGuids then
+                for i = 1, table.getn(eventGuids) do
+                    if eventGuids[i] == guid then
+                        if isUnknownName(SafeUnitName(guid)) then
+                            parser.pendingEvents[id] = nil
+                        end
+                        break
+                    end
+                end
+            end
+        end
+    end
+
     if not parser.enabled.death then return end
     healthCache[guid] = nil
-
-    if parser.processPendingEvents then
-        parser.processPendingEvents()
-    end
 
     if ShaguDPS.Combat() then
         -- 记录本场死亡的 BOSS（供脱战结算 boss_fights），并缓存血量最高的 BOSS 作为主首领
